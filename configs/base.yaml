@@ -1,0 +1,81 @@
+# Base training config for the Whisper-output correction SFT task.
+# Sections are just for readability -- train.py flattens them onto its Config
+# dataclass, so every key here must be a real field (typos raise an error).
+
+model_id: Qwen/Qwen3-1.7B
+# Either a local path to prepare_split.py's curated .jsonl (used as-is
+# below, with eval_fraction carving out validation) -- NOT build_dataset.py's
+# raw output directly, run it through prepare_split.py first -- or a Hub
+# dataset repo id, in which case set train_split/eval_split to its named
+# splits instead and eval_fraction is ignored.
+dataset_id: ./asr_dataset_curated.jsonl
+train_split: train
+eval_split: null
+eval_fraction: 0.1
+input_column: text_whisper
+target_column: text
+system_prompt: null   # null -> use the default prompt in data.py
+
+output_dir: ./outputs/qwen3-1.7b-base
+# 512 was fine for chunked-only training; assembled rows are now per-channel
+# full-call text (median ~114 words in our sample, up to several hundred),
+# so this needs enough headroom. Treated as a tunable hyperparameter -- 2048
+# covers more of the length distribution than 1024 at the cost of more
+# compute per long example, but still not the extreme long-call tail -- see
+# README's "Test-set evaluation" notes on chunking those at eval time.
+max_length: 2048
+# Rows too long for max_length are dropped, not truncated into the target
+# (see README) -- train.py prints how many were kept/truncated/dropped.
+on_long_example: drop   # drop | truncate
+
+training:
+  # 2, not 3: research on LoRA SFT (Raschka's empirical study) found extra
+  # epochs actively hurt via overfitting, and prepare_split.py's agree-bucket
+  # upsampling means some rows are already duplicated in this dataset -- 3
+  # epochs would see those ~6x, compounding the same risk.
+  num_train_epochs: 2.0
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  save_total_limit: 3
+  seed: 42
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+quantization:
+  load_in_4bit: false   # QLoRA; needs bitsandbytes + a CUDA GPU
+
+hub:
+  push_to_hub: true
+  # ONE shared repo for every experiment -- keep this the same across all
+  # your configs; each run gets its own folder inside it (see `folder`).
+  repo_id: PedramR/ASR_Post-processing
+  folder: null   # null -> defaults to output_dir's basename ("qwen3-1.7b-base" here)
+  private: true
+
+tensorboard:
+  logging_dir: null   # null -> defaults to <output_dir>/tb
+
+# Runs the model against a test set at every checkpoint save, computes WER,
+# and writes test_eval/predictions.jsonl + metrics.json under output_dir.
+# Leave dataset_id null to skip this entirely.
+test:
+  dataset_id: ErfanRou/callcc-test-1k
+  split: test
+  input_column: text_whisper
+  target_column: text
+  max_new_tokens: 1024   # raised alongside max_length -- a full-length correction shouldn't get cut off
+  batch_size: 8
+  max_examples: null   # cap for a faster per-checkpoint sanity check; null = full test set
+
+# false | true (resume from the latest checkpoint under output_dir) |
+# a local checkpoint path | "hub" to pull this run's folder from hub.repo_id first
+resume_from_checkpoint: false

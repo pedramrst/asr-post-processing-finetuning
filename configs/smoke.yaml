@@ -1,0 +1,57 @@
+# Tiny end-to-end smoke test -- exercises every component (train, save, Hub
+# sync, test eval, WER) cheaply, on a small local data slice, before
+# committing to a real multi-hour sweep. See run.sh.
+
+model_id: Qwen/Qwen3-1.7B
+dataset_id: ./asr_dataset_smoke_curated.jsonl
+train_split: train
+eval_split: null
+eval_fraction: 0.1
+input_column: text_whisper
+target_column: text
+system_prompt: null
+
+output_dir: ./outputs/smoke-test
+max_length: 2048
+on_long_example: drop
+
+training:
+  num_train_epochs: 1.0
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.03
+  logging_steps: 1
+  eval_steps: 5
+  save_steps: 5   # low on purpose: makes sure the hub-sync + test-eval callbacks actually fire at least once
+  save_total_limit: 2
+  seed: 42
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+quantization:
+  load_in_4bit: false
+
+hub:
+  push_to_hub: true
+  repo_id: PedramR/ASR_Post-processing
+  folder: smoke-test   # clearly-named throwaway folder in the shared repo -- safe to delete after
+  private: true
+
+tensorboard:
+  logging_dir: null
+
+test:
+  dataset_id: ErfanRou/callcc-test-1k
+  split: test
+  input_column: text_whisper
+  target_column: text
+  max_new_tokens: 1024
+  batch_size: 8
+  max_examples: 10   # small slice -- just needs to prove the eval loop works, not be a real benchmark
+
+resume_from_checkpoint: false

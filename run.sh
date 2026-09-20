@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Entry point for running this pipeline on a fresh Vast.ai (or any bare Ubuntu
+# + CUDA) instance. Assumes this repo is ALREADY on the instance -- there's no
+# git remote for it yet, so this script can't pull itself there; copy it up
+# first (git clone once you have a remote, rsync, scp, or Vast's file upload),
+# then run this from the repo root.
+#
+# Usage:
+#   ./run.sh smoke   (default) tiny end-to-end check: small local data slice,
+#                     1 epoch, low save_steps -- exercises train/save/hub-sync/
+#                     test-eval/WER cheaply before you commit to a real run.
+#   ./run.sh build    (Re)build + curate the full training dataset only.
+#   ./run.sh sweep    Run the 4-model comparison (configs/sweep.yaml). Assumes
+#                     the full dataset was already built (run `build` first).
+#   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
+#                     run `smoke` first if you haven't already.
+#
+# Runs inside tmux automatically (session name "run") so a dropped SSH
+# connection doesn't kill a long build/sweep -- reattach with `tmux attach -t run`.
+set -euo pipefail
+
+MODE="${1:-smoke}"
+ASSEMBLED_RATIO="${ASSEMBLED_RATIO:-0.3}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_DIR"
+
+log() { printf '\n=== %s ===\n' "$1"; }
+
+# --- Validate the mode before doing any expensive setup work ---------------
+case "$MODE" in
+  smoke|build|sweep|full) ;;
+  *)
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|sweep|full]" >&2
+    exit 1
+    ;;
+esac
+
+# --- Re-launch inside tmux so this survives an SSH disconnect -------------
+if [ -z "${TMUX:-}" ] && [ -z "${RUN_SH_NO_TMUX:-}" ]; then
+  if ! command -v tmux >/dev/null 2>&1; then
+    if [ "$(id -u)" = "0" ]; then
+      apt-get update -qq && apt-get install -y -qq tmux
+    else
+      sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+    fi
+  fi
+  log "Launching inside tmux session 'run' (reattach any time with: tmux attach -t run)"
+  tmux new-session -d -s run "cd '$REPO_DIR' && RUN_SH_NO_TMUX=1 ./run.sh $MODE; exec bash"
+  tmux attach -t run
+  exit 0
+fi
+
+# --- Sanity checks ----------------------------------------------------------
+log "GPU check"
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+  echo "No GPU detected (nvidia-smi failed) -- this pipeline requires CUDA. Aborting." >&2
+  exit 1
+fi
+nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+
+# --- Python + venv -----------------------------------------------------------
+log "Python environment"
+PYBIN="python3.12"
+if ! command -v "$PYBIN" >/dev/null 2>&1; then
+  echo "python3.12 not found, trying to install it..." >&2
+  if [ "$(id -u)" = "0" ]; then
+    apt-get update -qq && apt-get install -y -qq python3.12 python3.12-venv || true
+  else
+    sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv || true
+  fi
+fi
+if ! command -v "$PYBIN" >/dev/null 2>&1; then
+  echo "python3.12 unavailable, falling back to python3 (untested combination -- watch for dependency issues)." >&2
+  PYBIN="python3"
+fi
+
+if [ ! -d .venv ]; then
+  "$PYBIN" -m venv .venv
+fi
+source .venv/bin/activate
+pip install -q --upgrade pip
+pip install -q -r requirements.txt
+
+# --- HF auth ------------------------------------------------------------
+log "Hugging Face auth"
+if [ ! -f .env ]; then
+  if [ -n "${HF_TOKEN:-}" ]; then
+    echo "No .env found; writing one from the HF_TOKEN already set in this shell's environment." >&2
+    printf 'HF_TOKEN=%s\n' "$HF_TOKEN" > .env
+  else
+    cat >&2 <<'MSG'
+No .env and no HF_TOKEN environment variable set. Either:
+  - copy .env.example to .env and fill in a token with write access to the
+    hub.repo_id configured in your configs (see configs/base.yaml), or
+  - set HF_TOKEN in this shell (e.g. via Vast's instance environment
+    variables) before running this script.
+Aborting.
+MSG
+    exit 1
+  fi
+fi
+
+run_build() {
+  log "Building dataset (--assembled-ratio $ASSEMBLED_RATIO)"
+  python src/build_dataset.py --assembled-ratio "$ASSEMBLED_RATIO" --output-dir ./asr_dataset.jsonl
+  log "Curating dataset"
+  python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_curated.jsonl
+}
+
+run_smoke() {
+  log "Building smoke-test data slice (50 calls)"
+  python src/build_dataset.py --assembled-ratio 0.3 --max-calls 50 --output-dir ./asr_dataset_smoke.jsonl
+  python src/prepare_split.py --input ./asr_dataset_smoke.jsonl --output ./asr_dataset_smoke_curated.jsonl
+  log "Running smoke-test training (configs/smoke.yaml)"
+  python src/train.py --config configs/smoke.yaml
+  log "Smoke test complete -- check outputs/smoke-test/ and the 'smoke-test' folder in your Hub repo."
+}
+
+run_sweep() {
+  if [ ! -f ./asr_dataset_curated.jsonl ]; then
+    echo "./asr_dataset_curated.jsonl not found -- run './run.sh build' first." >&2
+    exit 1
+  fi
+  log "Running model comparison sweep (configs/sweep.yaml)"
+  python src/run_sweep.py --sweep configs/sweep.yaml
+}
+
+case "$MODE" in
+  smoke) run_smoke ;;
+  build) run_build ;;
+  sweep) run_sweep ;;
+  full)  run_build; run_sweep ;;
+  *)
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|sweep|full]" >&2
+    exit 1
+    ;;
+esac
+
+log "Done ($MODE)"

@@ -1,0 +1,73 @@
+# Standalone config for gemma-3-1b-it -- gets its own file rather than a
+# model_id override on top of base.yaml, since base.yaml's output_dir/hub
+# folder are literally named "qwen3-1.7b-base": overriding just model_id
+# there (as the old sweep.yaml did) would silently write this model's
+# checkpoints into a directory and Hub folder named after a different model.
+#
+# It's the smallest of the four candidate models (~1B, 2GB on disk) and gets
+# the most headroom on a 32GB RTX 5090, so per-device batch size is pushed
+# higher than base.yaml's for throughput -- an estimate, not a measurement
+# (nothing here has run on real hardware yet). If GPU utilization looks low
+# during a step (check `nvidia-smi`), there's likely room to push it
+# further; back off toward base.yaml's batch=4 if you hit OOM.
+#
+# Its chat template has no separate system-turn role (system content gets
+# folded into the first user turn) -- verified this doesn't break anything:
+# data.py's masking only depends on the prompt being a token-level prefix of
+# the full sequence, which still holds.
+
+model_id: google/gemma-3-1b-it
+dataset_id: ./asr_dataset_curated.jsonl
+train_split: train
+eval_split: null
+eval_fraction: 0.1
+input_column: text_whisper
+target_column: text
+system_prompt: null
+
+output_dir: ./outputs/gemma-3-1b-it
+max_length: 2048
+on_long_example: drop
+
+training:
+  # 2, not 3 -- see base.yaml's comment: extra epochs risk overfitting,
+  # compounded by prepare_split.py's row upsampling.
+  num_train_epochs: 2.0
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
+  learning_rate: 2.0e-4
+  warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  save_total_limit: 3
+  seed: 42
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+quantization:
+  load_in_4bit: false
+
+hub:
+  push_to_hub: true
+  repo_id: PedramR/ASR_Post-processing   # same shared repo as the other configs
+  folder: null   # null -> defaults to output_dir's basename ("gemma-3-1b-it" here)
+  private: true
+
+tensorboard:
+  logging_dir: null
+
+test:
+  dataset_id: ErfanRou/callcc-test-1k
+  split: test
+  input_column: text_whisper
+  target_column: text
+  max_new_tokens: 1024
+  batch_size: 8
+  max_examples: null
+
+resume_from_checkpoint: false

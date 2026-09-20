@@ -1,0 +1,12 @@
+transformers==5.17.0
+peft==0.21.0
+accelerate
+datasets
+huggingface_hub
+torch
+pyyaml
+tensorboard
+python-dotenv
+jiwer
+# only needed if training with --load_in_4bit (QLoRA) on a CUDA GPU
+# bitsandbytes

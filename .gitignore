@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+.env
+*.log
+
+# raw/preprocessed dataset files -- may contain real customer call data
+*.jsonl
+samples/
+
+outputs/
+
+# local model downloads (notebooks/load_model.ipynb's default LOCAL_DIR)
+downloaded_model/
+
+.DS_Store

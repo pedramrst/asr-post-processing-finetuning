@@ -1,0 +1,69 @@
+# Standalone config for Qwen3.5-2B -- a bigger, multimodal model than the
+# base.yaml default, so it gets its own file instead of a couple of
+# overrides on top of base.yaml.
+#
+# Batch size sized for a 32GB RTX 5090: per-device 4 (up from 2) with
+# gradient_accumulation 4 keeps the same effective batch size (16) as before
+# while using more of the card's memory per step for better throughput --
+# an estimate, not a measurement (nothing here has run on real hardware
+# yet). If you hit OOM on first run, drop per_device_train/eval_batch_size
+# back to 2 and double gradient_accumulation_steps to compensate; if GPU
+# utilization looks low (check `nvidia-smi` during a step), there's likely
+# room to push batch size higher still.
+
+
+model_id: Qwen/Qwen3.5-2B
+dataset_id: ./asr_dataset_curated.jsonl
+train_split: train
+eval_split: null
+eval_fraction: 0.1
+input_column: text_whisper
+target_column: text
+system_prompt: null
+
+output_dir: ./outputs/qwen3.5-2b
+max_length: 2048   # see base.yaml's comment -- assembled rows are now per-channel full-call text
+on_long_example: drop   # drop | truncate
+
+training:
+  # 2, not 3 -- see base.yaml's comment: extra epochs risk overfitting,
+  # compounded by prepare_split.py's row upsampling.
+  num_train_epochs: 2.0
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
+  logging_steps: 10
+  eval_steps: 200
+  save_steps: 200
+  save_total_limit: 3
+  seed: 42
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+
+quantization:
+  load_in_4bit: false
+
+hub:
+  push_to_hub: true
+  repo_id: PedramR/ASR_Post-processing   # same shared repo as base.yaml
+  folder: null   # null -> defaults to output_dir's basename ("qwen3.5-2b" here)
+  private: true
+
+tensorboard:
+  logging_dir: null   # null -> defaults to <output_dir>/tb
+
+test:
+  dataset_id: ErfanRou/callcc-test-1k
+  split: test
+  input_column: text_whisper
+  target_column: text
+  max_new_tokens: 1024
+  batch_size: 8
+  max_examples: null
+
+resume_from_checkpoint: false
