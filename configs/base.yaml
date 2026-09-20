@@ -12,6 +12,10 @@ dataset_id: ./asr_dataset_curated.jsonl
 train_split: train
 eval_split: null
 eval_fraction: 0.1
+# Deterministically subsamples only the train split to this fraction of its
+# rows (eval/validation stays full-size) -- e.g. for a data-scaling ablation.
+# null (default, as here) or 1.0 uses every row.
+train_fraction: null
 input_column: text_whisper
 target_column: text
 system_prompt: null   # null -> use the default prompt in data.py

@@ -158,7 +158,10 @@ def main() -> None:
         seed=cfg.seed,
         input_column=cfg.input_column,
         target_column=cfg.target_column,
+        train_fraction=cfg.train_fraction,
     )
+    if cfg.train_fraction is not None and cfg.train_fraction < 1.0:
+        print(f"train_fraction={cfg.train_fraction}: using {len(raw['train'])} train rows")
 
     length_stats = Counter()
 

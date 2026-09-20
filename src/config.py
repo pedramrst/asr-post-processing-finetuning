@@ -9,6 +9,7 @@ training run before anyone notices.
 """
 from __future__ import annotations
 
+import types
 import typing
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -65,6 +66,11 @@ class Config:
     # (e.g. build_dataset.py's output): fraction of it held
     # out for validation. Ignored for a Hub dataset_id -- use eval_split there.
     eval_fraction: float | None = None
+    # Deterministically subsamples only the train split to this fraction of
+    # its rows (e.g. 0.1 for 10%) -- for a data-scaling ablation without a
+    # separate curated file per fraction. Leaves eval/validation full-size.
+    # None (default) or 1.0 uses every row.
+    train_fraction: float | None = None
     input_column: str = "text_whisper"
     target_column: str = "text"
     system_prompt: str | None = None
@@ -157,7 +163,11 @@ def _coerce(value: Any, target_type: Any) -> Any:
     """
     if not isinstance(value, str):
         return value
-    if typing.get_origin(target_type) is typing.Union:
+    # `X | None` (PEP 604, used throughout Config's annotations) has origin
+    # types.UnionType, a *different* type from typing.Union/Optional[X]'s
+    # origin -- both need handling here, or every Optional field silently
+    # skips coercion and a `--set` override stays a str.
+    if typing.get_origin(target_type) in (typing.Union, types.UnionType):
         non_none = [a for a in typing.get_args(target_type) if a is not type(None)]
         if len(non_none) != 1:
             return value  # ambiguous union (e.g. bool | str) -- leave as given

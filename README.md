@@ -162,6 +162,12 @@ raises an error immediately rather than being silently ignored:
   case `eval_fraction` carves out a validation split, since that file has no
   predefined splits) or a Hub dataset repo id (in which case use
   `train_split`/`eval_split` instead).
+- `train_fraction`: deterministically subsamples only the train split to this
+  fraction of its rows (`eval`/`validation` stays full-size). `null`
+  (default) or `1.0` uses every row. Meant for a data-scaling ablation --
+  e.g. train on 10%/25%/50%/100% of the curated data and compare
+  `eval_loss`/test WER -- without hand-rolling a separate curated file per
+  fraction: `--set train_fraction=0.1`.
 - `max_length` / `on_long_example`: token budget for one tokenized example
   (prompt + target). Rows that don't fit are, by default
   (`on_long_example: drop`), excluded entirely rather than truncated --
@@ -208,6 +214,24 @@ Override individual values without editing the file with repeatable `--set`:
 python src/train.py --config configs/base.yaml \
   --set training.learning_rate=1e-4 \
   --set lora.r=32
+```
+
+For a quick run on a fraction of the curated data (e.g. as part of a
+data-scaling ablation), also override `output_dir`/`hub.folder` so it doesn't
+collide with a full run's:
+
+```bash
+python src/train.py --config configs/qwen3.5-2b.yaml \
+  --set train_fraction=0.1 \
+  --set output_dir=./outputs/qwen3.5-2b-10pct \
+  --set hub.folder=qwen3.5-2b-10pct
+```
+
+The same works through `./run.sh train <config>` -- anything after the
+config name is forwarded to `train.py` as-is:
+
+```bash
+./run.sh train qwen3.5-2b --set train_fraction=0.1 --set output_dir=./outputs/qwen3.5-2b-10pct
 ```
 
 ### Monitor

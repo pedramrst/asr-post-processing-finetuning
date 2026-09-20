@@ -17,6 +17,7 @@ dataset_id: ./asr_dataset_curated.jsonl
 train_split: train
 eval_split: null
 eval_fraction: 0.1
+train_fraction: 0.2   # data-scaling ablation: train on 20% of the curated set, not all of it
 input_column: text_whisper
 target_column: text
 system_prompt: null
@@ -35,14 +36,14 @@ training:
   learning_rate: 1.0e-4
   warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
   logging_steps: 10
-  eval_steps: 200
-  save_steps: 200
+  eval_steps: 100
+  save_steps: 100
   save_total_limit: 3
   seed: 42
 
 lora:
-  r: 16
-  alpha: 32
+  r: 32   # up from 16 -- alpha doubled alongside it to keep the alpha/r=2 scale unchanged
+  alpha: 64
   dropout: 0.05
 
 quantization:

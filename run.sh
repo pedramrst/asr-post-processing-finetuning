@@ -10,13 +10,17 @@
 #                     1 epoch, low save_steps -- exercises train/save/hub-sync/
 #                     test-eval/WER cheaply before you commit to a real run.
 #   ./run.sh build    (Re)build + curate the full training dataset only.
-#   ./run.sh train <config>
+#   ./run.sh train <config> [--set key=value ...]
 #                     Train just one config, e.g. `./run.sh train qwen3.5-2b`
 #                     or `./run.sh train gemma-3-1b-it` (bare names resolve to
 #                     configs/<name>.yaml; a path to any .yaml file also
-#                     works). Assumes the full dataset was already built (run
-#                     `build` first). Unlike `sweep`, output_dir/hub.folder
-#                     come straight from that config file, not auto-namespaced.
+#                     works). Anything after <config> is forwarded to
+#                     train.py, e.g. `./run.sh train qwen3.5-2b --set
+#                     train_fraction=0.1 --set output_dir=./outputs/qwen-10pct`
+#                     for a data-scaling ablation run. Assumes the full
+#                     dataset was already built (run `build` first). Unlike
+#                     `sweep`, output_dir/hub.folder come straight from that
+#                     config file, not auto-namespaced.
 #   ./run.sh sweep    Run the model comparison (configs/sweep.yaml). Assumes
 #                     the full dataset was already built (run `build` first).
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
@@ -158,9 +162,12 @@ run_sweep() {
 
 run_train() {
   local cfg="$1" config_path
+  shift
   # Accept a bare name (resolved against configs/, with or without .yaml) or
   # any path to a .yaml file, so both `./run.sh train qwen3.5-2b` and
-  # `./run.sh train configs/qwen3.5-2b.yaml` work.
+  # `./run.sh train configs/qwen3.5-2b.yaml` work. Anything after the config
+  # (e.g. `--set train_fraction=0.1 --set output_dir=...`) is forwarded
+  # straight to train.py.
   if [ -f "$cfg" ]; then
     config_path="$cfg"
   elif [ -f "configs/$cfg.yaml" ]; then
@@ -177,13 +184,13 @@ run_train() {
     exit 1
   fi
   log "Training $config_path"
-  python src/train.py --config "$config_path"
+  python src/train.py --config "$config_path" "$@"
 }
 
 case "$MODE" in
   smoke) run_smoke ;;
   build) run_build ;;
-  train) run_train "$CONFIG_ARG" ;;
+  train) run_train "$CONFIG_ARG" "${@:3}" ;;
   sweep) run_sweep ;;
   full)  run_build; run_sweep ;;
   *)

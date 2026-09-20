@@ -58,6 +58,7 @@ def load_sft_dataset(
     seed: int = 42,
     input_column: str = "text_whisper",
     target_column: str = "text",
+    train_fraction: float | None = None,
 ) -> DatasetDict:
     """Load the already-preprocessed dataset, from the Hub or a local file.
 
@@ -70,19 +71,34 @@ def load_sft_dataset(
     JSON Lines and, since it has no predefined splits, `eval_fraction` carves
     out a deterministic held-out slice for validation instead of `eval_split`
     (which only makes sense for a Hub dataset with named splits).
+
+    `train_fraction`, if set, deterministically (via `seed`) subsamples only
+    the train split afterwards -- e.g. for a data-scaling ablation (train on
+    10%/25%/50%/100% of the curated data, compare eval_loss/test WER) without
+    needing a separate curated file per fraction. `eval`/`validation` is left
+    at full size either way, since shrinking it would make those comparisons
+    noisier, not cheaper in any way that matters.
     """
     if Path(dataset_id).exists():
         raw = load_local_jsonl_columns(dataset_id, [input_column, target_column])
         if eval_fraction:
             split = raw.train_test_split(test_size=eval_fraction, seed=seed)
-            return DatasetDict(train=split["train"], validation=split["test"])
-        return DatasetDict(train=raw)
+            result = DatasetDict(train=split["train"], validation=split["test"])
+        else:
+            result = DatasetDict(train=raw)
+    else:
+        train_ds = load_dataset(dataset_id, split=train_split)
+        if eval_split:
+            eval_ds = load_dataset(dataset_id, split=eval_split)
+            result = DatasetDict(train=train_ds, validation=eval_ds)
+        else:
+            result = DatasetDict(train=train_ds)
 
-    train_ds = load_dataset(dataset_id, split=train_split)
-    if eval_split:
-        eval_ds = load_dataset(dataset_id, split=eval_split)
-        return DatasetDict(train=train_ds, validation=eval_ds)
-    return DatasetDict(train=train_ds)
+    if train_fraction is not None and train_fraction < 1.0:
+        n = round(len(result["train"]) * train_fraction)
+        result["train"] = result["train"].shuffle(seed=seed).select(range(n))
+
+    return result
 
 
 def build_example(
