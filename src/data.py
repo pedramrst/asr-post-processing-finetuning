@@ -1,11 +1,12 @@
 """Dataset loading and tokenization for the Whisper-output correction SFT task."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
-from datasets import DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from transformers import PreTrainedTokenizerBase
 
 SYSTEM_PROMPT = (
@@ -26,12 +27,37 @@ SYSTEM_PROMPT = (
 )
 
 
+def load_local_jsonl_columns(path: str, columns: list[str]) -> Dataset:
+    """Reads a local .jsonl file, keeping only `columns`.
+
+    `datasets.load_dataset("json", ...)` loads every column and asks pyarrow
+    to infer one unified schema for the whole file. build_dataset.py's output
+    has a `crm_context` column that's arbitrary, inconsistently-shaped JSON
+    copied straight from CRM records (a dict with no fixed set of keys, or
+    null) -- across chunks that confuses pyarrow's schema inference and the
+    load fails with e.g. "Couldn't cast array of type string to null", even
+    though training only ever reads two flat string columns. Parsing lines by
+    hand and dropping everything else sidesteps that entirely.
+    """
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            rows.append({c: obj.get(c) for c in columns})
+    return Dataset.from_list(rows)
+
+
 def load_sft_dataset(
     dataset_id: str,
     train_split: str,
     eval_split: str | None,
     eval_fraction: float | None = None,
     seed: int = 42,
+    input_column: str = "text_whisper",
+    target_column: str = "text",
 ) -> DatasetDict:
     """Load the already-preprocessed dataset, from the Hub or a local file.
 
@@ -46,7 +72,7 @@ def load_sft_dataset(
     (which only makes sense for a Hub dataset with named splits).
     """
     if Path(dataset_id).exists():
-        raw = load_dataset("json", data_files=dataset_id)["train"]
+        raw = load_local_jsonl_columns(dataset_id, [input_column, target_column])
         if eval_fraction:
             split = raw.train_test_split(test_size=eval_fraction, seed=seed)
             return DatasetDict(train=split["train"], validation=split["test"])

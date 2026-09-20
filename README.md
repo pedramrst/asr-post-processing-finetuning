@@ -15,6 +15,11 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+On a Vast.ai instance, skip this: `./run.sh` (below) reuses the image's
+preconfigured `/venv/main` instead of creating `.venv`, so `torch` stays the
+build already matched to that image's CUDA version rather than being
+re-downloaded from a plain `pip install`.
+
 You need read access to the gated `ErfanRou/callcc-2k` dataset, and to any
 gated model you train (e.g. `google/gemma-3-1b-it` requires an approved
 access request at https://huggingface.co/google/gemma-3-1b-it first).
@@ -38,12 +43,14 @@ training into one entry point, and re-launches itself inside `tmux` so a
 dropped SSH connection doesn't kill a multi-hour run:
 
 ```bash
-./run.sh smoke   # default: tiny end-to-end check (see configs/smoke.yaml) --
-                 # exercises train/save/hub-sync/test-eval/WER cheaply before
-                 # committing to a real run. Do this first.
-./run.sh build   # (re)build + curate the full training dataset
-./run.sh sweep   # the 4-model comparison (configs/sweep.yaml) -- needs `build` first
-./run.sh full    # build + sweep back to back -- multi-hour, real GPU cost
+./run.sh smoke                # default: tiny end-to-end check (see configs/smoke.yaml) --
+                               # exercises train/save/hub-sync/test-eval/WER cheaply before
+                               # committing to a real run. Do this first.
+./run.sh build                 # (re)build + curate the full training dataset
+./run.sh train qwen3.5-2b      # train just one config -- needs `build` first (see below)
+./run.sh train gemma-3-1b-it   # same, for the other config
+./run.sh sweep                 # the model comparison (configs/sweep.yaml) -- needs `build` first
+./run.sh full                  # build + sweep back to back -- multi-hour, real GPU cost
 ```
 
 There's no git remote for this repo yet, so `run.sh` can't pull the code onto
@@ -288,6 +295,13 @@ Jobs run one after another (they share a GPU) via `python src/train.py
 queue -- it's recorded and the rest still run. At the end, a summary ranked
 by test WER (falling back to eval loss for any job without `test.dataset_id`
 set) is printed and written to `<output_root>/summary.json`.
+
+To train just one of these configs instead of the whole queue, use
+`./run.sh train <name>` (e.g. `./run.sh train qwen3.5-2b`) or call
+`python src/train.py --config configs/qwen3.5-2b.yaml` directly. Either way,
+`output_dir`/`hub.folder` come straight from that config file (e.g.
+`./outputs/qwen3.5-2b`) rather than being namespaced under
+`sweep.yaml`'s `output_root` the way a `run_sweep.py` run would.
 
 ## 5. Load a trained model
 

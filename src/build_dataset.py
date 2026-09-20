@@ -51,6 +51,7 @@ from datetime import datetime
 import pyarrow.parquet as pq
 from dotenv import load_dotenv
 from huggingface_hub import HfFileSystem
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -150,7 +151,8 @@ def main():
 
     print(f"Writing to {output_path}", file=sys.stderr)
     with open(output_path, "w", encoding="utf-8") as out_f:
-        for fp in files:
+        pbar = tqdm(files, desc="shards", unit="shard")
+        for fp in pbar:
             if stop:
                 break
             tbl = read_remote_table(fs, fp, SEG_COLS)
@@ -247,6 +249,8 @@ def main():
                         out_f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
                         stats["rows_chunked"] += 1
                 stats["calls_kept"] += 1
+
+            pbar.set_postfix(calls=stats["calls_kept"], rows=stats["rows_assembled"] + stats["rows_chunked"])
 
     print("=== STATS ===", file=sys.stderr)
     for k, v in stats.items():

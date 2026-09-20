@@ -6,6 +6,7 @@ huggingface_hub
 torch
 pyyaml
 tensorboard
+tqdm
 python-dotenv
 jiwer
 # only needed if training with --load_in_4bit (QLoRA) on a CUDA GPU

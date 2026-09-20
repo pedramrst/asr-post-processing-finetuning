@@ -10,7 +10,14 @@
 #                     1 epoch, low save_steps -- exercises train/save/hub-sync/
 #                     test-eval/WER cheaply before you commit to a real run.
 #   ./run.sh build    (Re)build + curate the full training dataset only.
-#   ./run.sh sweep    Run the 4-model comparison (configs/sweep.yaml). Assumes
+#   ./run.sh train <config>
+#                     Train just one config, e.g. `./run.sh train qwen3.5-2b`
+#                     or `./run.sh train gemma-3-1b-it` (bare names resolve to
+#                     configs/<name>.yaml; a path to any .yaml file also
+#                     works). Assumes the full dataset was already built (run
+#                     `build` first). Unlike `sweep`, output_dir/hub.folder
+#                     come straight from that config file, not auto-namespaced.
+#   ./run.sh sweep    Run the model comparison (configs/sweep.yaml). Assumes
 #                     the full dataset was already built (run `build` first).
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
 #                     run `smoke` first if you haven't already.
@@ -20,6 +27,7 @@
 set -euo pipefail
 
 MODE="${1:-smoke}"
+CONFIG_ARG="${2:-}"
 ASSEMBLED_RATIO="${ASSEMBLED_RATIO:-0.3}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
@@ -29,8 +37,16 @@ log() { printf '\n=== %s ===\n' "$1"; }
 # --- Validate the mode before doing any expensive setup work ---------------
 case "$MODE" in
   smoke|build|sweep|full) ;;
+  train)
+    if [ -z "$CONFIG_ARG" ]; then
+      echo "Usage: ./run.sh train <config-name-or-path>" >&2
+      echo "Available configs:" >&2
+      ls configs/*.yaml | sed 's/^/  /' >&2
+      exit 1
+    fi
+    ;;
   *)
-    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|sweep|full]" >&2
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full]" >&2
     exit 1
     ;;
 esac
@@ -45,7 +61,8 @@ if [ -z "${TMUX:-}" ] && [ -z "${RUN_SH_NO_TMUX:-}" ]; then
     fi
   fi
   log "Launching inside tmux session 'run' (reattach any time with: tmux attach -t run)"
-  tmux new-session -d -s run "cd '$REPO_DIR' && RUN_SH_NO_TMUX=1 ./run.sh $MODE; exec bash"
+  ARGS="$(printf '%q ' "$@")"
+  tmux new-session -d -s run "cd '$REPO_DIR' && RUN_SH_NO_TMUX=1 ./run.sh $ARGS; exec bash"
   tmux attach -t run
   exit 0
 fi
@@ -60,24 +77,34 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 
 # --- Python + venv -----------------------------------------------------------
 log "Python environment"
-PYBIN="python3.12"
-if ! command -v "$PYBIN" >/dev/null 2>&1; then
-  echo "python3.12 not found, trying to install it..." >&2
-  if [ "$(id -u)" = "0" ]; then
-    apt-get update -qq && apt-get install -y -qq python3.12 python3.12-venv || true
-  else
-    sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv || true
+if [ -f /venv/main/bin/activate ]; then
+  # Vast.ai PyTorch templates ship a preconfigured venv at /venv/main with
+  # torch already built against that image's CUDA version. Reusing it avoids
+  # a slow, redundant torch re-download and the risk of pip resolving a torch
+  # build that doesn't match the image. requirements.txt leaves `torch`
+  # unpinned specifically so installing into this env below won't touch it.
+  echo "Found /venv/main -- reusing it instead of creating a new venv." >&2
+  source /venv/main/bin/activate
+else
+  PYBIN="python3.12"
+  if ! command -v "$PYBIN" >/dev/null 2>&1; then
+    echo "python3.12 not found, trying to install it..." >&2
+    if [ "$(id -u)" = "0" ]; then
+      apt-get update -qq && apt-get install -y -qq python3.12 python3.12-venv || true
+    else
+      sudo apt-get update -qq && sudo apt-get install -y -qq python3.12 python3.12-venv || true
+    fi
   fi
-fi
-if ! command -v "$PYBIN" >/dev/null 2>&1; then
-  echo "python3.12 unavailable, falling back to python3 (untested combination -- watch for dependency issues)." >&2
-  PYBIN="python3"
-fi
+  if ! command -v "$PYBIN" >/dev/null 2>&1; then
+    echo "python3.12 unavailable, falling back to python3 (untested combination -- watch for dependency issues)." >&2
+    PYBIN="python3"
+  fi
 
-if [ ! -d .venv ]; then
-  "$PYBIN" -m venv .venv
+  if [ ! -d .venv ]; then
+    "$PYBIN" -m venv .venv
+  fi
+  source .venv/bin/activate
 fi
-source .venv/bin/activate
 pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
@@ -125,13 +152,38 @@ run_sweep() {
   python src/run_sweep.py --sweep configs/sweep.yaml
 }
 
+run_train() {
+  local cfg="$1" config_path
+  # Accept a bare name (resolved against configs/, with or without .yaml) or
+  # any path to a .yaml file, so both `./run.sh train qwen3.5-2b` and
+  # `./run.sh train configs/qwen3.5-2b.yaml` work.
+  if [ -f "$cfg" ]; then
+    config_path="$cfg"
+  elif [ -f "configs/$cfg.yaml" ]; then
+    config_path="configs/$cfg.yaml"
+  elif [ -f "configs/$cfg" ]; then
+    config_path="configs/$cfg"
+  else
+    echo "Config not found: '$cfg'. Available configs:" >&2
+    ls configs/*.yaml | sed 's/^/  /' >&2
+    exit 1
+  fi
+  if [ ! -f ./asr_dataset_curated.jsonl ]; then
+    echo "./asr_dataset_curated.jsonl not found -- run './run.sh build' first." >&2
+    exit 1
+  fi
+  log "Training $config_path"
+  python src/train.py --config "$config_path"
+}
+
 case "$MODE" in
   smoke) run_smoke ;;
   build) run_build ;;
+  train) run_train "$CONFIG_ARG" ;;
   sweep) run_sweep ;;
   full)  run_build; run_sweep ;;
   *)
-    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|sweep|full]" >&2
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full]" >&2
     exit 1
     ;;
 esac

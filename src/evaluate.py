@@ -19,13 +19,13 @@ from pathlib import Path
 
 import jiwer
 import torch
-from datasets import Dataset, load_dataset
+from datasets import Dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfFileSystem
 from transformers import TrainerCallback
 from transformers.trainer import PREFIX_CHECKPOINT_DIR
 
-from data import SYSTEM_PROMPT
+from data import SYSTEM_PROMPT, load_local_jsonl_columns
 
 load_dotenv()
 
@@ -93,7 +93,7 @@ def run_test_eval(
     max_examples: int | None = None,
 ) -> dict:
     ds = (
-        load_dataset("json", data_files=dataset_id)["train"]
+        load_local_jsonl_columns(dataset_id, [input_column, target_column])
         if Path(dataset_id).exists()
         else _load_hub_columns_pruned(dataset_id, [input_column, target_column], split)
     )

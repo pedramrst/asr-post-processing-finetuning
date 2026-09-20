@@ -151,7 +151,13 @@ def main() -> None:
     model.print_trainable_parameters()
 
     raw = load_sft_dataset(
-        cfg.dataset_id, cfg.train_split, cfg.eval_split, eval_fraction=cfg.eval_fraction, seed=cfg.seed
+        cfg.dataset_id,
+        cfg.train_split,
+        cfg.eval_split,
+        eval_fraction=cfg.eval_fraction,
+        seed=cfg.seed,
+        input_column=cfg.input_column,
+        target_column=cfg.target_column,
     )
 
     length_stats = Counter()
@@ -202,6 +208,7 @@ def main() -> None:
         bf16=True,
         gradient_checkpointing=True,
         report_to=["tensorboard"],
+        disable_tqdm=False,
         seed=cfg.seed,
         # Hub sync is handled ourselves (hub_sync.py), not Trainer's built-in
         # push_to_hub/hub_strategy -- those assume the whole target repo IS
