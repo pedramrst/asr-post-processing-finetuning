@@ -57,7 +57,7 @@ hub:
   push_to_hub: true
   repo_id: PedramR/ASR_Post-processing   # same shared repo as the other configs
   folder: null   # null -> defaults to output_dir's basename ("gemma-3-1b-it" here)
-  private: true
+  private: false
 
 tensorboard:
   logging_dir: null

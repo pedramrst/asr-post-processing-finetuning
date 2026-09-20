@@ -52,6 +52,7 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "batch_size": "test_batch_size",
         "max_examples": "test_max_examples",
         "hallucination_overlap_floor": "test_hallucination_overlap_floor",
+        "baseline": "test_baseline",
     },
 }
 
@@ -136,6 +137,15 @@ class Config:
     # reference. Independent of wer/exact_match, which only compare against
     # the reference and can't tell "wrong correction" from "invented content".
     test_hallucination_overlap_floor: float = 50.0
+    # Runs one extra test-set eval before the first training step (LoRA's
+    # B matrix is zero-initialized, so the freshly-wrapped, untrained model
+    # is numerically identical to the plain base model here) -- saved
+    # separately under output_dir/test_eval_baseline/ and logged to
+    # TensorBoard at step 0, so test_wer/test_exact_match/
+    # test_hallucination_rate curves show the pre-fine-tuning starting point,
+    # not just the first checkpoint. Skipped on a resumed run (not "before
+    # fine-tuning" then) or when test_dataset_id is unset.
+    test_baseline: bool = True
 
 
 def _flatten(raw: dict[str, Any]) -> dict[str, Any]:
@@ -160,6 +170,9 @@ def _coerce(value: Any, target_type: Any) -> Any:
     float -- `1e-4` (no decimal point) is valid Python but comes back as the
     *string* "1e-4" under YAML 1.1 rules, which would otherwise pass silently
     into TrainingArguments and break there instead of at config-load time.
+    Also needed for a `--set some_bool_field=false`-style override: every
+    non-empty string is truthy in Python, so without this a bool field would
+    silently stay "false" (== True) instead of becoming False.
     """
     if not isinstance(value, str):
         return value
@@ -172,6 +185,13 @@ def _coerce(value: Any, target_type: Any) -> Any:
         if len(non_none) != 1:
             return value  # ambiguous union (e.g. bool | str) -- leave as given
         target_type = non_none[0]
+    if target_type is bool:
+        low = value.lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+        raise ValueError(f"Cannot parse {value!r} as bool -- use true/false.")
     if target_type is float:
         return float(value)
     if target_type is int:

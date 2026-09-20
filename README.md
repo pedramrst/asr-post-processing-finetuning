@@ -302,6 +302,21 @@ triggers a generation pass over that dataset: the model corrects each
 Use `test.max_examples` to cap the test set for faster per-checkpoint checks
 if the full set is slow to run repeatedly.
 
+### Baseline (pre-fine-tuning) evaluation
+
+If `test.dataset_id` is set and `test.baseline` is true (the default), one
+extra eval runs *before the first training step*, saved separately under
+`test_eval_baseline/predictions.jsonl` + `metrics.json` and logged to
+TensorBoard at step 0 -- so the `test_wer`/`test_exact_match`/
+`test_hallucination_rate` curves show where the model started, not just the
+first checkpoint. This doesn't need a separate unadapted-model load: LoRA's
+`B` matrix is zero-initialized, so the freshly-wrapped, untrained model is
+numerically identical to the plain base model at that point. Skipped
+automatically on a resumed run (`resume_from_checkpoint` set) -- the original
+run already captured this -- or set `test.baseline: false` to skip it
+otherwise (e.g. re-running several `train_fraction` ablations of the same
+model, where the baseline would be identical every time).
+
 ### Best checkpoint by WER
 
 Trainer's built-in `load_best_model_at_end`/`metric_for_best_model` only

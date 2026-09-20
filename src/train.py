@@ -240,7 +240,39 @@ def main() -> None:
     if test_eval_callback is not None:
         test_eval_callback.trainer = trainer
 
-    trainer.train(resume_from_checkpoint=resolve_resume_checkpoint(cfg))
+    resume_checkpoint = resolve_resume_checkpoint(cfg)
+
+    # LoRA's B matrix is zero-initialized, so the just-wrapped, untrained
+    # model is numerically identical to the plain base model right now --
+    # this doubles as a pre-fine-tuning baseline without a separate
+    # unadapted model load. Skipped on a resumed run, since step 0 there
+    # already has a real baseline from the original run.
+    if cfg.test_dataset_id and cfg.test_baseline and resume_checkpoint is None:
+        print("Baseline test-set eval (before any training steps)...")
+        baseline_metrics = run_test_eval(
+            model,
+            tokenizer,
+            dataset_id=cfg.test_dataset_id,
+            input_column=cfg.test_input_column,
+            target_column=cfg.test_target_column,
+            output_path=str(output_dir / "test_eval_baseline" / "predictions.jsonl"),
+            system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
+            split=cfg.test_split,
+            max_new_tokens=cfg.test_max_new_tokens,
+            batch_size=cfg.test_batch_size,
+            max_examples=cfg.test_max_examples,
+            hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+        )
+        print(f"Baseline: wer={baseline_metrics['wer']}, exact_match={baseline_metrics['exact_match']}, "
+              f"hallucination_rate={baseline_metrics['hallucination_rate']}")
+        if baseline_metrics["wer"] is not None:
+            trainer.log({
+                "test_wer": baseline_metrics["wer"],
+                "test_exact_match": baseline_metrics["exact_match"],
+                "test_hallucination_rate": baseline_metrics["hallucination_rate"],
+            })
+
+    trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
 
@@ -260,6 +292,7 @@ def main() -> None:
             max_new_tokens=cfg.test_max_new_tokens,
             batch_size=cfg.test_batch_size,
             max_examples=cfg.test_max_examples,
+            hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
         )
         # source_dir == output_dir here (the just-saved final adapter/tokenizer
         # files, not a numbered checkpoint) -- update_best_checkpoint's ignore

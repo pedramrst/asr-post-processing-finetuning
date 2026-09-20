@@ -53,7 +53,7 @@ hub:
   push_to_hub: true
   repo_id: PedramR/ASR_Post-processing   # same shared repo as base.yaml
   folder: null   # null -> defaults to output_dir's basename ("qwen3.5-2b" here)
-  private: true
+  private: false
 
 tensorboard:
   logging_dir: null   # null -> defaults to <output_dir>/tb
