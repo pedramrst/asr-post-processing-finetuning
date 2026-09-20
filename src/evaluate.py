@@ -13,14 +13,46 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import tempfile
 from pathlib import Path
 
 import jiwer
 import torch
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
+from dotenv import load_dotenv
+from huggingface_hub import HfFileSystem
 from transformers import TrainerCallback
+from transformers.trainer import PREFIX_CHECKPOINT_DIR
 
 from data import SYSTEM_PROMPT
+
+load_dotenv()
+
+
+def _load_hub_columns_pruned(repo_id: str, columns: list[str], split: str) -> Dataset:
+    """Loads only `columns` from a Hub dataset's parquet shards, over HTTP.
+
+    `datasets.load_dataset(repo_id, split=...)` downloads whole parquet
+    files regardless of which columns you use afterwards -- fine for a
+    text-only dataset, but callcc-test-1k (like callcc-2k, see
+    build_dataset.py) has audio embedded in the same files. This mirrors
+    build_dataset.py's technique: pyarrow's column selection over a
+    random-access remote file object only fetches the byte ranges for the
+    requested columns, so audio is never pulled over the wire.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    fs = HfFileSystem()
+    paths = sorted(fs.glob(f"datasets/{repo_id}/data/{split}-*.parquet"))
+    if not paths:
+        raise FileNotFoundError(f"No data/{split}-*.parquet files found in {repo_id}")
+    tables = []
+    for path in paths:
+        with fs.open(path, "rb") as f:
+            tables.append(pq.ParquetFile(f).read(columns=columns, use_threads=True))
+    return Dataset(pa.concat_tables(tables))
 
 
 @torch.no_grad()
@@ -63,8 +95,13 @@ def run_test_eval(
     ds = (
         load_dataset("json", data_files=dataset_id)["train"]
         if Path(dataset_id).exists()
-        else load_dataset(dataset_id, split=split)
+        else _load_hub_columns_pruned(dataset_id, [input_column, target_column], split)
     )
+    # callcc-test-1k has a small fraction of rows (~1%) with a null
+    # text_whisper -- filter before truncating to max_examples, so a small
+    # slice doesn't end up mostly-nulls-that-get-dropped-anyway, and so a
+    # None never reaches apply_chat_template as a message's content.
+    ds = ds.filter(lambda ex: ex[input_column] and ex[target_column])
     if max_examples:
         ds = ds.select(range(min(max_examples, len(ds))))
 
@@ -84,6 +121,16 @@ def run_test_eval(
 
     references = [ex[target_column] for ex in ds]
     corpus_wer = jiwer.process_words(references, predictions).wer if references else None
+    # Stricter complement to WER (which gives partial credit for near
+    # misses): what fraction did the model get exactly right. Also a direct
+    # read on over/under-correction -- see build_example's system prompt
+    # design and prepare_split.py's agree-bucket upsampling, both aimed at
+    # this exact failure mode.
+    exact_match = (
+        sum(1 for p, r in zip(predictions, references) if p.strip() == r.strip()) / len(references)
+        if references
+        else None
+    )
 
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -98,9 +145,48 @@ def run_test_eval(
                 + "\n"
             )
 
-    metrics = {"wer": corpus_wer, "n_examples": len(ds)}
+    metrics = {"wer": corpus_wer, "exact_match": exact_match, "n_examples": len(ds)}
     out_path.with_name("metrics.json").write_text(json.dumps(metrics, indent=2))
     return metrics
+
+
+def update_best_checkpoint(output_dir: str, source_dir: str, metrics: dict, step: int) -> tuple[bool, float | None]:
+    """Copies source_dir into <output_dir>/best_checkpoint_wer/ if metrics['wer']
+    beats whatever's recorded there -- read back from that folder's own
+    best_metrics.json rather than kept in memory, so this is correct across
+    resumed runs too, not just within one process's lifetime.
+
+    source_dir may be a numbered checkpoint dir, or output_dir itself (the
+    post-training final-model case in train.py) -- the ignore patterns below
+    exist specifically so the latter doesn't try to copy output_dir into a
+    subdirectory of itself.
+
+    Returns (updated, current_best_wer) -- current_best_wer is the running
+    best after this call, whether or not this call was the one that set it,
+    so callers can log a monotonic "best so far" curve either way.
+    """
+    if metrics.get("wer") is None:
+        return False, None
+
+    best_dir = Path(output_dir) / "best_checkpoint_wer"
+    best_metrics_path = best_dir / "best_metrics.json"
+    if best_metrics_path.exists():
+        current_best = json.loads(best_metrics_path.read_text())["wer"]
+        if metrics["wer"] >= current_best:
+            return False, current_best
+
+    tmp_dir = tempfile.mkdtemp(prefix="best_checkpoint_wer_")
+    shutil.copytree(
+        source_dir,
+        tmp_dir,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns("best_checkpoint_wer", f"{PREFIX_CHECKPOINT_DIR}-*", "test_eval", "tb"),
+    )
+    (Path(tmp_dir) / "best_metrics.json").write_text(json.dumps({"step": step, **metrics}, indent=2))
+    if best_dir.exists():
+        shutil.rmtree(best_dir)
+    shutil.move(tmp_dir, str(best_dir))
+    return True, metrics["wer"]
 
 
 class TestEvalCallback(TrainerCallback):
@@ -137,8 +223,15 @@ class TestEvalCallback(TrainerCallback):
             batch_size=self.cfg.test_batch_size,
             max_examples=self.cfg.test_max_examples,
         )
+
+        checkpoint_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
+        _, best_wer = update_best_checkpoint(self.cfg.output_dir, str(checkpoint_dir), metrics, state.global_step)
+
         if self.trainer is not None and metrics["wer"] is not None:
-            self.trainer.log({"test_wer": metrics["wer"]})
+            log_values = {"test_wer": metrics["wer"], "test_exact_match": metrics["exact_match"]}
+            if best_wer is not None:
+                log_values["test_best_wer"] = best_wer
+            self.trainer.log(log_values)
 
 
 def _cli() -> None:

@@ -32,7 +32,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingA
 
 from config import Config, load_config
 from data import SYSTEM_PROMPT, PadCollator, build_example, load_sft_dataset
-from evaluate import TestEvalCallback, run_test_eval
+from evaluate import TestEvalCallback, run_test_eval, update_best_checkpoint
 from hub_sync import SyncToHubCallback, repo_folder_name, sync_output_dir
 
 load_dotenv()
@@ -238,7 +238,7 @@ def main() -> None:
     # so it's not covered by the last on_save-triggered callback run -- redo
     # test eval + hub sync once more here to capture it.
     if cfg.test_dataset_id:
-        run_test_eval(
+        final_metrics = run_test_eval(
             model,
             tokenizer,
             dataset_id=cfg.test_dataset_id,
@@ -251,6 +251,11 @@ def main() -> None:
             batch_size=cfg.test_batch_size,
             max_examples=cfg.test_max_examples,
         )
+        # source_dir == output_dir here (the just-saved final adapter/tokenizer
+        # files, not a numbered checkpoint) -- update_best_checkpoint's ignore
+        # patterns exist specifically so this doesn't copy output_dir into a
+        # subdirectory of itself.
+        update_best_checkpoint(cfg.output_dir, cfg.output_dir, final_metrics, trainer.state.global_step)
     if cfg.push_to_hub:
         sync_output_dir(cfg, commit_message="final")
 

@@ -205,6 +205,7 @@ Every run's `output_dir` ends up self-contained:
 outputs/qwen3-1.7b-base/
   config.yaml               the fully-resolved config that produced this run
   checkpoint-200/, checkpoint-400/, ...   pruned locally by save_total_limit
+  best_checkpoint_wer/      best checkpoint by test WER seen so far, if test.dataset_id is set
   tb/                       TensorBoard event files
   test_eval/predictions.jsonl, metrics.json   latest test-set results, if test.dataset_id is set
   adapter_model.safetensors, tokenizer files, ...   the final saved adapter
@@ -222,18 +223,42 @@ accumulating every checkpoint ever saved.
 
 If `test.dataset_id` is set, every checkpoint save (and the final model)
 triggers a generation pass over that dataset: the model corrects each
-`test.input_column` value, WER is computed against `test.target_column` (via
-`jiwer`, corpus-level), and:
+`test.input_column` value, and scored against `test.target_column`:
 
 - `test_eval/predictions.jsonl` -- one row per example: `input`, `output`,
   `reference`, `wer`. Overwritten each time with the latest checkpoint's
   results (not one file per checkpoint).
-- `test_eval/metrics.json` -- `{"wer": ..., "n_examples": ...}`.
-- the aggregate WER is also logged to TensorBoard as `test_wer`, so you get
-  a WER-vs-training-step curve, not just a final number.
+- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "n_examples": ...}`.
+  `wer` (via `jiwer`, corpus-level) gives partial credit for near-misses;
+  `exact_match` (fraction of rows the model got byte-for-byte right) is a
+  stricter complementary read, and a direct signal on over/under-correction
+  -- the same failure mode the system prompt and `prepare_split.py`'s
+  agree-bucket upsampling are aimed at.
+- both are also logged to TensorBoard as `test_wer`/`test_exact_match`, so
+  you get curves over training steps, not just final numbers.
 
 Use `test.max_examples` to cap the test set for faster per-checkpoint checks
 if the full set is slow to run repeatedly.
+
+### Best checkpoint by WER
+
+Trainer's built-in `load_best_model_at_end`/`metric_for_best_model` only
+tracks metrics from its own eval loop (`eval_loss`, computed on the training
+data's held-out split) -- it has no way to know about `test_wer`, since
+that's computed by a separate callback via actual generation on a different
+dataset, not inside `Trainer.evaluate()`. So best-checkpoint tracking here is
+custom, and deliberately tracks WER rather than loss, since WER against a
+real test set is the metric that's mattered throughout this project, not
+training loss.
+
+Every checkpoint save (and the final model) compares its test WER against
+whatever's recorded in `output_dir/best_checkpoint_wer/best_metrics.json`;
+if it's better, that whole checkpoint gets copied there (overwriting the
+previous best), tagged with its step and metrics. This is read back from
+disk each time rather than kept in memory, so it stays correct across a
+resumed run too. It only exists when `test.dataset_id` is set, and it's a
+full independent copy -- pruning older numbered checkpoints via
+`save_total_limit` never affects it.
 
 ## 4. Compare multiple models/configs
 
