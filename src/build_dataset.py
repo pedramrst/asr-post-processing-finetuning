@@ -13,6 +13,14 @@ channel), and a merged-channel row doesn't correspond to anything actually
 corrected in one pass in production -- each speaker's channel is handled on
 its own.
 
+Production runs correction over one full call channel at a time (confirmed,
+not just inferred from callcc-test-1k's row shape) -- so assembled rows are
+the primary training signal, not a minority, and --assembled-ratio should
+normally be high (see the flag description below). Chunked rows are kept as
+a smaller supplementary set: they're what carries prepare_split.py's
+low-WER "already correct, leave it alone" signal, since only chunked rows
+get a `bucket` label.
+
 Shards are read column-pruned over HTTP via HfFileSystem instead of being
 downloaded whole: `audio` is embedded in the same parquet files as the text
 columns we need, and a plain snapshot_download would pull every shard's
@@ -27,7 +35,15 @@ not take or store a token itself.
 Flags:
   --assembled-ratio FLOAT   Required. Fraction (0-1) of calls emitted as a
                             single assembled conversation; the rest are
-                            emitted as one row per segment ("chunked").
+                            emitted as one row per segment ("chunked"). Since
+                            production corrects one full channel at a time,
+                            this should normally be high (e.g. 0.9) so most
+                            of the raw data is even eligible to become
+                            assembled rows -- prepare_split.py's
+                            --assembled-target-frac can only ever downsample
+                            assembled rows relative to chunked ones, never
+                            manufacture more, so it can't fix an insufficient
+                            supply of them created here.
   --seed INT                Optional, default 42. Seeds the deterministic
                             per-call assembled/chunked assignment; same seed
                             + ratio always yields the same split.
@@ -38,7 +54,7 @@ Flags:
                             (testing).
 
 Example:
-  python3 src/build_dataset.py --assembled-ratio 0.3
+  python3 src/build_dataset.py --assembled-ratio 0.9
 """
 import argparse
 import hashlib

@@ -50,6 +50,7 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "max_new_tokens": "test_max_new_tokens",
         "batch_size": "test_batch_size",
         "max_examples": "test_max_examples",
+        "hallucination_overlap_floor": "test_hallucination_overlap_floor",
     },
 }
 
@@ -122,6 +123,13 @@ class Config:
     test_max_new_tokens: int = 256
     test_batch_size: int = 8
     test_max_examples: int | None = None
+    # A prediction is flagged "hallucinated" (predictions.jsonl + the
+    # test_hallucination_rate TensorBoard curve) when under this % of its
+    # words appear anywhere in the input -- i.e. the model said things the
+    # input never did, regardless of whether it happens to match the
+    # reference. Independent of wer/exact_match, which only compare against
+    # the reference and can't tell "wrong correction" from "invented content".
+    test_hallucination_overlap_floor: float = 50.0
 
 
 def _flatten(raw: dict[str, Any]) -> dict[str, Any]:

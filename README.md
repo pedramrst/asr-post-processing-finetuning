@@ -67,7 +67,8 @@ configs/smoke.yaml      tiny end-to-end config used by `run.sh smoke`
 build_dataset.py       (in src/) downloads + preprocesses callcc-2k into a
                         local .jsonl, column-pruned so audio is never fetched
 src/prepare_split.py    curates build_dataset.py's output: drops misaligned
-                        pairs, upsamples low-WER rows, caps assembled rows
+                        pairs, upsamples low-WER rows, balances assembled vs
+                        chunked rows
 src/data.py             dataset loading + tokenization/label-masking
 src/config.py           YAML config -> Config dataclass, with typo checking
 src/evaluate.py         runs the model on a test set, scores WER, saves
@@ -95,7 +96,7 @@ notebooks/load_model.ipynb
 ## 1. Build the training data
 
 ```bash
-python src/build_dataset.py --assembled-ratio 0.3 --output-dir ./asr_dataset.jsonl
+python src/build_dataset.py --assembled-ratio 0.9 --output-dir ./asr_dataset.jsonl
 ```
 
 Each call is randomly (but deterministically, via `--seed`) assigned to
@@ -103,8 +104,14 @@ either "assembled" rows (one row per channel, that channel's full turn
 sequence joined into one example -- matching how `callcc-test-1k` and actual
 serving are structured: one channel corrected at a time, not both speakers
 merged) or "chunked" rows (one example per segment); `--assembled-ratio`
-controls what fraction of calls become assembled. Use `--max-calls`/
-`--max-shards` to generate a small sample first. See
+controls what fraction of calls become assembled. Since production actually
+corrects one full call channel at a time (confirmed, not just inferred from
+`callcc-test-1k`'s row shape), this should normally be high -- assembled
+rows are the primary training signal, not a minority. `prepare_split.py`'s
+`--assembled-target-frac` (below) can only ever downsample assembled rows
+relative to chunked ones, never manufacture more, so an insufficient supply
+here can't be fixed downstream. Use `--max-calls`/`--max-shards` to generate
+a small sample first. See
 [docs/asr_dataset_builder.md](docs/asr_dataset_builder.md) for the full
 column schema and an example row of each type.
 
@@ -118,17 +125,28 @@ python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_c
 ```
 
 - **Drops likely-misaligned pairs** (`wer_whisper` above `--wer-cap`, default
-  `1.0`): the highest-WER raw rows turned out to be cases where Whisper's
-  segment window drifted onto a different utterance entirely, not a
-  genuinely correctable ASR error. Training on those teaches hallucinated
-  rewrites rather than correction.
+  `1.0`, *or* `overlap_pct` below `--overlap-floor`, default `30.0`): the
+  highest-WER raw rows turned out to be cases where Whisper's segment window
+  drifted onto a different utterance entirely, not a genuinely correctable
+  ASR error. Training on those teaches hallucinated rewrites rather than
+  correction. `overlap_pct` (word-overlap between `text_whisper` and the
+  target) is a second, largely independent signal for the same failure mode
+  -- WER is length-normalized and can stay misleadingly low on a misaligned
+  pair, while overlap collapses toward zero whenever the two sides are
+  actually about different content. `--overlap-floor`'s default is a
+  starting point, not tuned against real data -- check the drop counts
+  printed to stderr and adjust.
 - **Upsamples low-WER (`agree`-bucket) rows** to `--agree-target-frac`
   (default `0.225`) of the chunked rows: natural rate is only ~11%, and
   without enough "already correct, leave it" examples the model risks
   over-correcting fine transcripts in production.
-- **Caps assembled (full-channel) rows** to `--assembled-target-frac` (default
-  `0.10`) of the output -- downsampled if there are more than that, never
-  artificially inflated if there are fewer.
+- **Balances assembled (full-channel) vs. chunked (per-segment) rows** to
+  `--assembled-target-frac` (default `0.85`) of the output: assembled rows are
+  the primary training signal, since production corrects one full channel at
+  a time, so whichever side (assembled or chunked) is oversupplied relative
+  to that ratio gets downsampled -- neither side is ever upsampled to hit it,
+  so a target that the raw mix can't support falls back to whatever ratio the
+  scarce side allows (printed to stderr as `achieved`).
 
 Point `dataset_id` in your config at this curated file, not the raw one from
 step 1.
@@ -152,7 +170,10 @@ raises an error immediately rather than being silently ignored:
   anyway. Either way, a row whose *prompt alone* already exceeds
   `max_length` is always dropped, since there'd be no room left for any
   target token. `train.py` prints how many rows were kept/truncated/dropped
-  after tokenizing.
+  after tokenizing -- worth checking after raising `prepare_split.py`'s
+  `--assembled-target-frac`, since assembled (full-channel) rows are much
+  longer than chunked ones and a higher assembled share means more of them
+  can exceed `max_length` and get dropped exactly where they matter most.
 - `training.*`: epochs, batch size, learning rate, save/eval cadence, etc.
 - `lora.*`: LoRA rank/alpha/dropout.
 - `quantization.load_in_4bit`: QLoRA; needs `bitsandbytes` + a CUDA GPU.
@@ -233,15 +254,25 @@ triggers a generation pass over that dataset: the model corrects each
 `test.input_column` value, and scored against `test.target_column`:
 
 - `test_eval/predictions.jsonl` -- one row per example: `input`, `output`,
-  `reference`, `wer`. Overwritten each time with the latest checkpoint's
-  results (not one file per checkpoint).
-- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "n_examples": ...}`.
+  `reference`, `wer`, `input_overlap_pct`, `hallucinated`. Overwritten each
+  time with the latest checkpoint's results (not one file per checkpoint).
+- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "hallucination_rate": ..., "n_examples": ...}`.
   `wer` (via `jiwer`, corpus-level) gives partial credit for near-misses;
   `exact_match` (fraction of rows the model got byte-for-byte right) is a
   stricter complementary read, and a direct signal on over/under-correction
   -- the same failure mode the system prompt and `prepare_split.py`'s
   agree-bucket upsampling are aimed at.
-- both are also logged to TensorBoard as `test_wer`/`test_exact_match`, so
+- `hallucination_rate` / `hallucinated` / `input_overlap_pct` are a separate
+  axis from `wer`/`exact_match`: those two only compare the output against
+  the *reference*, so they can't distinguish "wrong correction" from
+  "invented content ungrounded in the input." `input_overlap_pct` is the
+  share of the *output*'s words that actually appear in the *input*; a row
+  is flagged `hallucinated` when that's below `test.hallucination_overlap_floor`
+  (default `50.0`). This is the model's actual generation behavior, a
+  complement to `prepare_split.py`'s `--overlap-floor` (below), which instead
+  filters *training* pairs before the model ever sees them.
+- all three (`wer`, `exact_match`, `hallucination_rate`) are also logged to
+  TensorBoard as `test_wer`/`test_exact_match`/`test_hallucination_rate`, so
   you get curves over training steps, not just final numbers.
 
 Use `test.max_examples` to cap the test set for faster per-checkpoint checks

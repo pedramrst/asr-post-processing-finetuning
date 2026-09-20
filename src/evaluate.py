@@ -15,6 +15,7 @@ import argparse
 import json
 import shutil
 import tempfile
+from collections import Counter
 from pathlib import Path
 
 import jiwer
@@ -55,6 +56,22 @@ def _load_hub_columns_pruned(repo_id: str, columns: list[str], split: str) -> Da
     return Dataset(pa.concat_tables(tables))
 
 
+def _word_overlap_pct(a: str, b: str) -> float:
+    """% of `a`'s words that also appear (as a multiset) in `b`.
+
+    Same metric as build_dataset.py's word_metrics(), applied here between a
+    model's *output* and its *input* rather than text_whisper and the
+    target -- a low score means the model produced words ungrounded in what
+    it was actually given, i.e. hallucination, regardless of whether the
+    output happens to match the reference.
+    """
+    wa = a.split()
+    if not wa:
+        return 100.0
+    ca, cb = Counter(wa), Counter(b.split())
+    return round(sum((ca & cb).values()) / len(wa) * 100, 2)
+
+
 @torch.no_grad()
 def generate_batch(model, tokenizer, prompts: list[str], max_new_tokens: int, batch_size: int) -> list[str]:
     """Greedy-decodes already chat-templated `prompts` in batches."""
@@ -91,6 +108,7 @@ def run_test_eval(
     max_new_tokens: int = 256,
     batch_size: int = 8,
     max_examples: int | None = None,
+    hallucination_overlap_floor: float = 50.0,
 ) -> dict:
     ds = (
         load_local_jsonl_columns(dataset_id, [input_column, target_column])
@@ -132,20 +150,45 @@ def run_test_eval(
         else None
     )
 
+    # Flags predictions ungrounded in what the model was actually given --
+    # distinct from wer/exact_match, which only compare against the
+    # reference and can't tell "wrong correction" from "invented content".
+    # `_word_overlap_pct(pred, input)` is the fraction of the *output*'s
+    # words found in the *input*; a low score means the model said things
+    # the input never did, regardless of whether it happens to match the
+    # reference.
+    input_overlaps = [_word_overlap_pct(pred, ex[input_column]) for ex, pred in zip(ds, predictions)]
+    hallucinated_flags = [ov < hallucination_overlap_floor for ov in input_overlaps]
+
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        for ex, pred, ref in zip(ds, predictions, references):
+        for ex, pred, ref, input_overlap, hallucinated in zip(
+            ds, predictions, references, input_overlaps, hallucinated_flags
+        ):
             row_wer = jiwer.process_words([ref], [pred]).wer if ref else None
             f.write(
                 json.dumps(
-                    {"input": ex[input_column], "output": pred, "reference": ref, "wer": row_wer},
+                    {
+                        "input": ex[input_column],
+                        "output": pred,
+                        "reference": ref,
+                        "wer": row_wer,
+                        "input_overlap_pct": input_overlap,
+                        "hallucinated": hallucinated,
+                    },
                     ensure_ascii=False,
                 )
                 + "\n"
             )
 
-    metrics = {"wer": corpus_wer, "exact_match": exact_match, "n_examples": len(ds)}
+    hallucination_rate = sum(hallucinated_flags) / len(hallucinated_flags) if hallucinated_flags else None
+    metrics = {
+        "wer": corpus_wer,
+        "exact_match": exact_match,
+        "hallucination_rate": hallucination_rate,
+        "n_examples": len(ds),
+    }
     out_path.with_name("metrics.json").write_text(json.dumps(metrics, indent=2))
     return metrics
 
@@ -222,13 +265,18 @@ class TestEvalCallback(TrainerCallback):
             max_new_tokens=self.cfg.test_max_new_tokens,
             batch_size=self.cfg.test_batch_size,
             max_examples=self.cfg.test_max_examples,
+            hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
         )
 
         checkpoint_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
         _, best_wer = update_best_checkpoint(self.cfg.output_dir, str(checkpoint_dir), metrics, state.global_step)
 
         if self.trainer is not None and metrics["wer"] is not None:
-            log_values = {"test_wer": metrics["wer"], "test_exact_match": metrics["exact_match"]}
+            log_values = {
+                "test_wer": metrics["wer"],
+                "test_exact_match": metrics["exact_match"],
+                "test_hallucination_rate": metrics["hallucination_rate"],
+            }
             if best_wer is not None:
                 log_values["test_best_wer"] = best_wer
             self.trainer.log(log_values)
@@ -246,6 +294,8 @@ def _cli() -> None:
     p.add_argument("--max_new_tokens", type=int, default=256)
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--max_examples", type=int, default=None)
+    p.add_argument("--hallucination_overlap_floor", type=float, default=50.0,
+                    help="Flag a prediction as hallucinated when under this %% of its words appear in the input.")
     args = p.parse_args()
 
     import torch as _torch
@@ -266,6 +316,7 @@ def _cli() -> None:
         max_new_tokens=args.max_new_tokens,
         batch_size=args.batch_size,
         max_examples=args.max_examples,
+        hallucination_overlap_floor=args.hallucination_overlap_floor,
     )
     print(json.dumps(metrics, indent=2))
 

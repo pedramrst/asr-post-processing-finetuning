@@ -28,7 +28,11 @@ set -euo pipefail
 
 MODE="${1:-smoke}"
 CONFIG_ARG="${2:-}"
-ASSEMBLED_RATIO="${ASSEMBLED_RATIO:-0.3}"
+# Production corrects one full call channel at a time, so assembled
+# (full-channel) rows should dominate the raw data -- see build_dataset.py's
+# docstring. prepare_split.py's --assembled-target-frac then balances the
+# curated split from whatever this produces.
+ASSEMBLED_RATIO="${ASSEMBLED_RATIO:-0.9}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
@@ -136,7 +140,7 @@ run_build() {
 
 run_smoke() {
   log "Building smoke-test data slice (50 calls)"
-  python src/build_dataset.py --assembled-ratio 0.3 --max-calls 50 --output-dir ./asr_dataset_smoke.jsonl
+  python src/build_dataset.py --assembled-ratio "$ASSEMBLED_RATIO" --max-calls 50 --output-dir ./asr_dataset_smoke.jsonl
   python src/prepare_split.py --input ./asr_dataset_smoke.jsonl --output ./asr_dataset_smoke_curated.jsonl
   log "Running smoke-test training (configs/smoke.yaml)"
   python src/train.py --config configs/smoke.yaml
