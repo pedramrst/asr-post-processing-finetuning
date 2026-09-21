@@ -78,7 +78,18 @@ test:
   target_column: text
   max_new_tokens: 1024   # raised alongside max_length -- a full-length correction shouldn't get cut off
   batch_size: 8
-  max_examples: null   # cap for a faster per-checkpoint sanity check; null = full test set
+  max_examples: null   # full test set -- used for the one-time baseline (pre-training) and final evals
+  # Separate, usually smaller cap for the *repeated* per-checkpoint eval --
+  # with a frequent eval_steps/save_steps this can fire hundreds of times, so
+  # running the full set there every time multiplies eval cost far beyond
+  # training itself. null falls back to max_examples above (no separate cap).
+  checkpoint_max_examples: null
+  # Optional second, small eval set focused on named entities -- see
+  # src/build_entity_eval_slice.py and README's "Named-entity eval slice".
+  # Aggregate WER above mixes entity-heavy and entity-free calls together,
+  # which hides weak named-entity correction inside a number dominated by
+  # everything else. null skips this entirely.
+  entity_dataset_id: null
 
 # false | true (resume from the latest checkpoint under output_dir) |
 # a local checkpoint path | "hub" to pull this run's folder from hub.repo_id first

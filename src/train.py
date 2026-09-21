@@ -262,15 +262,44 @@ def main() -> None:
             batch_size=cfg.test_batch_size,
             max_examples=cfg.test_max_examples,
             hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+            repetition_penalty=cfg.test_repetition_penalty,
+            no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
         )
         print(f"Baseline: wer={baseline_metrics['wer']}, exact_match={baseline_metrics['exact_match']}, "
               f"hallucination_rate={baseline_metrics['hallucination_rate']}")
         if baseline_metrics["wer"] is not None:
             trainer.log({
                 "test_wer": baseline_metrics["wer"],
+                "test_wer_zwnj_normalized": baseline_metrics["wer_zwnj_normalized"],
                 "test_exact_match": baseline_metrics["exact_match"],
                 "test_hallucination_rate": baseline_metrics["hallucination_rate"],
             })
+
+        if cfg.test_entity_dataset_id:
+            baseline_entity_metrics = run_test_eval(
+                model,
+                tokenizer,
+                dataset_id=cfg.test_entity_dataset_id,
+                input_column=cfg.test_input_column,
+                target_column=cfg.test_target_column,
+                output_path=str(output_dir / "test_eval_entity_baseline" / "predictions.jsonl"),
+                system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
+                split=cfg.test_split,
+                max_new_tokens=cfg.test_max_new_tokens,
+                batch_size=cfg.test_batch_size,
+                hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+                repetition_penalty=cfg.test_repetition_penalty,
+                no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
+            )
+            print(f"Baseline (entity slice): wer={baseline_entity_metrics['wer']}, "
+                  f"exact_match={baseline_entity_metrics['exact_match']}")
+            if baseline_entity_metrics["wer"] is not None:
+                trainer.log({
+                    "test_entity_wer": baseline_entity_metrics["wer"],
+                    "test_entity_wer_zwnj_normalized": baseline_entity_metrics["wer_zwnj_normalized"],
+                    "test_entity_exact_match": baseline_entity_metrics["exact_match"],
+                    "test_entity_hallucination_rate": baseline_entity_metrics["hallucination_rate"],
+                })
 
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(cfg.output_dir)
@@ -293,12 +322,31 @@ def main() -> None:
             batch_size=cfg.test_batch_size,
             max_examples=cfg.test_max_examples,
             hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+            repetition_penalty=cfg.test_repetition_penalty,
+            no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
         )
         # source_dir == output_dir here (the just-saved final adapter/tokenizer
         # files, not a numbered checkpoint) -- update_best_checkpoint's ignore
         # patterns exist specifically so this doesn't copy output_dir into a
         # subdirectory of itself.
         update_best_checkpoint(cfg.output_dir, cfg.output_dir, final_metrics, trainer.state.global_step)
+
+        if cfg.test_entity_dataset_id:
+            run_test_eval(
+                model,
+                tokenizer,
+                dataset_id=cfg.test_entity_dataset_id,
+                input_column=cfg.test_input_column,
+                target_column=cfg.test_target_column,
+                output_path=str(output_dir / "test_eval_entity" / "predictions.jsonl"),
+                system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
+                split=cfg.test_split,
+                max_new_tokens=cfg.test_max_new_tokens,
+                batch_size=cfg.test_batch_size,
+                hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+                repetition_penalty=cfg.test_repetition_penalty,
+                no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
+            )
     if cfg.push_to_hub:
         sync_output_dir(cfg, commit_message="final")
 

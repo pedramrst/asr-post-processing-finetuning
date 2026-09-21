@@ -51,8 +51,12 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "max_new_tokens": "test_max_new_tokens",
         "batch_size": "test_batch_size",
         "max_examples": "test_max_examples",
+        "checkpoint_max_examples": "test_checkpoint_max_examples",
         "hallucination_overlap_floor": "test_hallucination_overlap_floor",
+        "repetition_penalty": "test_repetition_penalty",
+        "no_repeat_ngram_size": "test_no_repeat_ngram_size",
         "baseline": "test_baseline",
+        "entity_dataset_id": "test_entity_dataset_id",
     },
 }
 
@@ -129,7 +133,16 @@ class Config:
     test_target_column: str = "text"
     test_max_new_tokens: int = 256
     test_batch_size: int = 8
+    # Full-set size used for the one-time baseline (before training) and
+    # final (after training) evals. Leave null for the full test set -- those
+    # only run once each, so the accurate number is worth the time.
     test_max_examples: int | None = None
+    # Separate, usually much smaller cap for the *repeated* per-checkpoint
+    # eval (TestEvalCallback) -- with eval_steps=100 over a long run, that
+    # can fire hundreds of times, so running the full set there every time
+    # multiplies eval cost far beyond training itself. null falls back to
+    # test_max_examples (i.e. no separate cap).
+    test_checkpoint_max_examples: int | None = None
     # A prediction is flagged "hallucinated" (predictions.jsonl + the
     # test_hallucination_rate TensorBoard curve) when under this % of its
     # words appear anywhere in the input -- i.e. the model said things the
@@ -137,6 +150,17 @@ class Config:
     # reference. Independent of wer/exact_match, which only compare against
     # the reference and can't tell "wrong correction" from "invented content".
     test_hallucination_overlap_floor: float = 50.0
+    # Greedy decoding (test generation uses do_sample=False) is prone to a
+    # degenerate failure: once a short, locally-high-probability phrase
+    # repeats a couple times -- e.g. this task's real "بله" (yes)
+    # agreement-word bursts, which do occur naturally as short runs in
+    # training segments -- it can get stuck repeating it for the rest of
+    # max_new_tokens instead of stopping. Observed directly: ~1 in 6-7 test
+    # outputs on this task's fine-tuned checkpoints degenerated this way,
+    # tanking wer/hallucination_rate on otherwise-good predictions. These
+    # are the standard mitigation; 1.0/0 disables each respectively.
+    test_repetition_penalty: float = 1.2
+    test_no_repeat_ngram_size: int = 3
     # Runs one extra test-set eval before the first training step (LoRA's
     # B matrix is zero-initialized, so the freshly-wrapped, untrained model
     # is numerically identical to the plain base model here) -- saved
@@ -146,6 +170,18 @@ class Config:
     # not just the first checkpoint. Skipped on a resumed run (not "before
     # fine-tuning" then) or when test_dataset_id is unset.
     test_baseline: bool = True
+    # Optional second, usually much smaller eval set focused on named
+    # entities (person/place/order names), run alongside the main test set
+    # at baseline/every checkpoint/final -- results saved under
+    # test_eval_entity/ (test_eval_entity_baseline/ for the pre-training
+    # pass) and logged to TensorBoard as test_entity_wer/
+    # test_entity_exact_match/test_entity_hallucination_rate. Aggregate WER
+    # on the full test set mixes entity-heavy and entity-free calls
+    # together, which can hide exactly the failure mode (weak named-entity
+    # correction) this is meant to track on its own. Reuses every other
+    # test.* generation setting (input/target column, batch size,
+    # repetition_penalty, ...); null skips this entirely.
+    test_entity_dataset_id: str | None = None
 
 
 def _flatten(raw: dict[str, Any]) -> dict[str, Any]:

@@ -64,7 +64,28 @@ test:
   input_column: text_whisper
   target_column: text
   max_new_tokens: 1024
-  batch_size: 8
-  max_examples: null
+  # Up from 8 -- generation has no gradient/optimizer memory of its own, but
+  # this still runs inside the training process's existing GPU footprint
+  # (LoRA + AdamW state are already resident during a mid-training eval).
+  # Measured: this reproduced a CUDA OOM on the step right after the first
+  # checkpoint eval, twice, on a 32GB RTX 5090 -- not a raw capacity problem
+  # (the error showed ~7.5GiB "reserved but unallocated") but generation's
+  # KV-cache churn fragmenting PyTorch's allocator badly enough to break the
+  # next backward pass. Mitigated via torch.cuda.empty_cache() in
+  # evaluate.py's run_test_eval() + PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+  # (run.sh) -- if it recurs anyway, drop this back down before anything else.
+  batch_size: 16
+  max_examples: null   # full test set -- only used for the one-time baseline/final evals
+  # Repeated per-checkpoint eval (every eval_steps/save_steps) uses a much
+  # smaller slice instead, since callcc-test-1k's full ~1k examples at
+  # max_new_tokens=1024 was taking ~3h per pass -- multiplied across ~635
+  # checkpoint saves in this run, that dwarfs training time itself. Adjust
+  # if the trend signal is too noisy or still too slow.
+  checkpoint_max_examples: 150
+  # Small (268-row), ground-truth-backed named-entity slice of
+  # callcc-test-1k -- see src/build_entity_eval_slice.py and README's
+  # "Named-entity eval slice". Tracked separately (test_entity_wer etc.) so
+  # weak entity correction can't hide inside the aggregate test_wer number.
+  entity_dataset_id: ./data/entity_eval_slice.jsonl
 
 resume_from_checkpoint: false

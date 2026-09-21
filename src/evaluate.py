@@ -23,6 +23,7 @@ import torch
 from datasets import Dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfFileSystem
+from tqdm import tqdm
 from transformers import TrainerCallback
 from transformers.trainer import PREFIX_CHECKPOINT_DIR
 
@@ -56,6 +57,18 @@ def _load_hub_columns_pruned(repo_id: str, columns: list[str], split: str) -> Da
     return Dataset(pa.concat_tables(tables))
 
 
+def _strip_zwnj(text: str) -> str:
+    """Removes ZWNJ (U+200C), the half-space Persian compound words use.
+
+    "میگیره" (glued) and "می‌گیره" (correct ZWNJ half-space) become the same
+    string here, so a WER computed on stripped text scores only genuine
+    content/word-choice errors -- e.g. mis-heard names or terms -- separately
+    from ZWNJ formatting, which the system prompt also asks for but is a much
+    lower-stakes mistake than a wrong word.
+    """
+    return text.replace("‌", "")
+
+
 def _word_overlap_pct(a: str, b: str) -> float:
     """% of `a`'s words that also appear (as a multiset) in `b`.
 
@@ -73,13 +86,35 @@ def _word_overlap_pct(a: str, b: str) -> float:
 
 
 @torch.no_grad()
-def generate_batch(model, tokenizer, prompts: list[str], max_new_tokens: int, batch_size: int) -> list[str]:
-    """Greedy-decodes already chat-templated `prompts` in batches."""
+def generate_batch(
+    model,
+    tokenizer,
+    prompts: list[str],
+    max_new_tokens: int,
+    batch_size: int,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
+) -> list[str]:
+    """Greedy-decodes already chat-templated `prompts` in batches.
+
+    Plain greedy decoding (the default `repetition_penalty=1.0`,
+    `no_repeat_ngram_size=0` -- no-ops) is prone to a well-known degenerate
+    failure: once a short, locally-high-probability phrase repeats a couple
+    times (e.g. this task's "بله" agreement-word bursts, which do occur
+    naturally as short runs in real training segments), greedy search can
+    get stuck repeating it indefinitely instead of finding the actual
+    stopping point, running all the way to max_new_tokens. Observed directly
+    on this task's fine-tuned checkpoints: ~1 in 6-7 test outputs degenerated
+    into a runaway repeat loop, tanking WER/hallucination_rate on otherwise
+    good predictions. `repetition_penalty`/`no_repeat_ngram_size` are the
+    standard mitigation.
+    """
     outputs = []
     prior_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"  # so every sequence in a batch ends at the same index
     try:
-        for i in range(0, len(prompts), batch_size):
+        batch_starts = range(0, len(prompts), batch_size)
+        for i in tqdm(batch_starts, desc="generating", unit="batch"):
             batch = prompts[i : i + batch_size]
             enc = tokenizer(batch, return_tensors="pt", padding=True, add_special_tokens=False)
             enc = {k: v.to(model.device) for k, v in enc.items()}
@@ -88,6 +123,8 @@ def generate_batch(model, tokenizer, prompts: list[str], max_new_tokens: int, ba
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
             )
             new_tokens = generated[:, enc["input_ids"].shape[1] :]
             outputs.extend(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))
@@ -109,6 +146,8 @@ def run_test_eval(
     batch_size: int = 8,
     max_examples: int | None = None,
     hallucination_overlap_floor: float = 50.0,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
 ) -> dict:
     ds = (
         load_local_jsonl_columns(dataset_id, [input_column, target_column])
@@ -134,11 +173,37 @@ def run_test_eval(
 
     was_training = model.training
     model.eval()
-    predictions = generate_batch(model, tokenizer, prompts, max_new_tokens, batch_size)
+    predictions = generate_batch(
+        model, tokenizer, prompts, max_new_tokens, batch_size,
+        repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size,
+    )
     model.train(was_training)
+    # Generation's KV cache grows token-by-token across variably-long
+    # sequences, allocating/freeing many differently-sized tensors -- when
+    # this runs mid-training (TestEvalCallback, in the same process as the
+    # Trainer), that fragments PyTorch's CUDA caching allocator badly enough
+    # that a later training step's backward pass can OOM trying to allocate
+    # a single large contiguous block, even though nominal free memory looks
+    # sufficient (observed: ~7.5GiB "reserved but unallocated" on a 32GB
+    # card immediately breaking the next backward pass). Releasing eval's
+    # cached blocks back to the driver here prevents that fragmentation from
+    # carrying into training.
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     references = [ex[target_column] for ex in ds]
     corpus_wer = jiwer.process_words(references, predictions).wer if references else None
+    # Same WER, but with ZWNJ (half-space) differences removed from both
+    # sides first -- isolates genuine content/word-choice errors (e.g.
+    # mis-heard names) from spacing-only mismatches, which `corpus_wer` above
+    # counts identically even though they're a much lower-stakes mistake.
+    corpus_wer_zwnj_normalized = (
+        jiwer.process_words(
+            [_strip_zwnj(r) for r in references], [_strip_zwnj(p) for p in predictions]
+        ).wer
+        if references
+        else None
+    )
     # Stricter complement to WER (which gives partial credit for near
     # misses): what fraction did the model get exactly right. Also a direct
     # read on over/under-correction -- see build_example's system prompt
@@ -167,6 +232,9 @@ def run_test_eval(
             ds, predictions, references, input_overlaps, hallucinated_flags
         ):
             row_wer = jiwer.process_words([ref], [pred]).wer if ref else None
+            row_wer_zwnj_normalized = (
+                jiwer.process_words([_strip_zwnj(ref)], [_strip_zwnj(pred)]).wer if ref else None
+            )
             f.write(
                 json.dumps(
                     {
@@ -174,6 +242,7 @@ def run_test_eval(
                         "output": pred,
                         "reference": ref,
                         "wer": row_wer,
+                        "wer_zwnj_normalized": row_wer_zwnj_normalized,
                         "input_overlap_pct": input_overlap,
                         "hallucinated": hallucinated,
                     },
@@ -185,6 +254,7 @@ def run_test_eval(
     hallucination_rate = sum(hallucinated_flags) / len(hallucinated_flags) if hallucinated_flags else None
     metrics = {
         "wer": corpus_wer,
+        "wer_zwnj_normalized": corpus_wer_zwnj_normalized,
         "exact_match": exact_match,
         "hallucination_rate": hallucination_rate,
         "n_examples": len(ds),
@@ -253,6 +323,15 @@ class TestEvalCallback(TrainerCallback):
         self.trainer = None
 
     def on_save(self, args, state, control, **kwargs):
+        # This fires on every checkpoint save (potentially hundreds of times
+        # over a long run) -- test_checkpoint_max_examples, when set, keeps
+        # each of those cheap; test_max_examples (the full set, typically) is
+        # reserved for the one-time baseline/final evals in train.py.
+        max_examples = (
+            self.cfg.test_checkpoint_max_examples
+            if self.cfg.test_checkpoint_max_examples is not None
+            else self.cfg.test_max_examples
+        )
         metrics = run_test_eval(
             self.model,
             self.tokenizer,
@@ -264,8 +343,10 @@ class TestEvalCallback(TrainerCallback):
             split=self.cfg.test_split,
             max_new_tokens=self.cfg.test_max_new_tokens,
             batch_size=self.cfg.test_batch_size,
-            max_examples=self.cfg.test_max_examples,
+            max_examples=max_examples,
             hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
+            repetition_penalty=self.cfg.test_repetition_penalty,
+            no_repeat_ngram_size=self.cfg.test_no_repeat_ngram_size,
         )
 
         checkpoint_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
@@ -274,12 +355,37 @@ class TestEvalCallback(TrainerCallback):
         if self.trainer is not None and metrics["wer"] is not None:
             log_values = {
                 "test_wer": metrics["wer"],
+                "test_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
                 "test_exact_match": metrics["exact_match"],
                 "test_hallucination_rate": metrics["hallucination_rate"],
             }
             if best_wer is not None:
                 log_values["test_best_wer"] = best_wer
             self.trainer.log(log_values)
+
+        if self.cfg.test_entity_dataset_id:
+            entity_metrics = run_test_eval(
+                self.model,
+                self.tokenizer,
+                dataset_id=self.cfg.test_entity_dataset_id,
+                input_column=self.cfg.test_input_column,
+                target_column=self.cfg.test_target_column,
+                output_path=str(Path(self.cfg.output_dir) / "test_eval_entity" / "predictions.jsonl"),
+                system_prompt=self.cfg.system_prompt or SYSTEM_PROMPT,
+                split=self.cfg.test_split,
+                max_new_tokens=self.cfg.test_max_new_tokens,
+                batch_size=self.cfg.test_batch_size,
+                hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
+                repetition_penalty=self.cfg.test_repetition_penalty,
+                no_repeat_ngram_size=self.cfg.test_no_repeat_ngram_size,
+            )
+            if self.trainer is not None and entity_metrics["wer"] is not None:
+                self.trainer.log({
+                    "test_entity_wer": entity_metrics["wer"],
+                    "test_entity_wer_zwnj_normalized": entity_metrics["wer_zwnj_normalized"],
+                    "test_entity_exact_match": entity_metrics["exact_match"],
+                    "test_entity_hallucination_rate": entity_metrics["hallucination_rate"],
+                })
 
 
 def _cli() -> None:
@@ -296,6 +402,12 @@ def _cli() -> None:
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--hallucination_overlap_floor", type=float, default=50.0,
                     help="Flag a prediction as hallucinated when under this %% of its words appear in the input.")
+    p.add_argument("--repetition_penalty", type=float, default=1.2,
+                    help="Penalizes repeated tokens during greedy decoding -- mitigates runaway repeat loops "
+                         "(e.g. this task's short natural agreement-word bursts spiraling into hundreds of "
+                         "repeats). 1.0 disables it.")
+    p.add_argument("--no_repeat_ngram_size", type=int, default=3,
+                    help="Hard-blocks repeating any n-gram of this size that's already appeared. 0 disables it.")
     args = p.parse_args()
 
     import torch as _torch
@@ -317,6 +429,8 @@ def _cli() -> None:
         batch_size=args.batch_size,
         max_examples=args.max_examples,
         hallucination_overlap_floor=args.hallucination_overlap_floor,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
     )
     print(json.dumps(metrics, indent=2))
 

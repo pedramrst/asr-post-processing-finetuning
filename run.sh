@@ -116,6 +116,26 @@ fi
 pip install -q --upgrade pip
 pip install -q -r requirements.txt
 
+# Optional, best-effort: speeds up Qwen3.5's hybrid SSM/linear-attention
+# layers, used in both training and generation (eval). Without them,
+# transformers falls back to a correct but much slower reference PyTorch
+# path -- not fatal, so unlike requirements.txt above this is allowed to
+# fail without aborting the whole script: these are CUDA/torch-version-
+# sensitive compiled extensions, not guaranteed to build on every image.
+log "Installing optional attention kernels (causal-conv1d, flash-linear-attention)"
+pip install -q causal-conv1d flash-linear-attention || echo "Optional kernel install failed -- continuing without it (correct, just slower)." >&2
+
+# Mid-training test-set generation (TestEvalCallback) allocates/frees many
+# differently-sized KV-cache tensors in the same process as the Trainer,
+# which fragments PyTorch's CUDA caching allocator badly enough to OOM a
+# later training step's backward pass even when nominal free memory looks
+# sufficient (observed directly: a later step failed to allocate 7.18GiB
+# with 7.5GiB "reserved but unallocated" sitting right there). This is
+# PyTorch's own suggested mitigation -- letting allocator segments grow/
+# shrink instead of being fixed-size -- as defense-in-depth alongside the
+# explicit torch.cuda.empty_cache() in evaluate.py's run_test_eval().
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+
 # --- HF auth ------------------------------------------------------------
 log "Hugging Face auth"
 if [ ! -f .env ]; then

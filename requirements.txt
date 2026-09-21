@@ -11,3 +11,9 @@ python-dotenv
 jiwer
 # only needed if training with --load_in_4bit (QLoRA) on a CUDA GPU
 # bitsandbytes
+# optional: speeds up Qwen3.5's hybrid SSM/linear-attention layers (falls
+# back to a correct but much slower reference PyTorch path without them).
+# CUDA/torch-version-sensitive compiled extensions -- run.sh installs these
+# best-effort (won't abort the script if the build fails); not required.
+# causal-conv1d
+# flash-linear-attention

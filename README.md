@@ -147,6 +147,31 @@ python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_c
   to that ratio gets downsampled -- neither side is ever upsampled to hit it,
   so a target that the raw mix can't support falls back to whatever ratio the
   scarce side allows (printed to stderr as `achieved`).
+- **Upsamples confirmed-named-entity rows** to `--entity-target-frac` (default
+  `0.5`) of the output. Each real name/order-number appears in maybe one or
+  two calls total, so without this the model sees very few gradient updates
+  per entity relative to common dictation errors that repeat across hundreds
+  of rows -- directly investigating fine-tuned predictions found reliable
+  fixes for dictation-form errors (stutters, word-boundary merges, ZWNJ) but
+  zero confirmed successes on an actually mis-heard name in a small sample.
+  Detection reuses `build_dataset.py`'s `crm_context` (only ever present on
+  assembled rows) the same way `build_entity_eval_slice.py` does for the eval
+  slice below: a row counts as "entity" only if the CRM customer name or
+  case-owner name has a word that actually appears in the target text -- a
+  confirmed real entity, not a rare-word heuristic guess. `0` disables it.
+  `--entity-max-repeats` (default `5`) caps how many times any single row
+  can be duplicated to get there -- verified directly: distinct customer
+  names scale roughly linearly with how many raw calls you process (~324
+  distinct names found in a real 6,000-call sample), but `--entity-target-
+  frac` is a fraction of the whole output regardless of corpus size, so
+  without a cap a small distinct pool relative to a large non-entity pool
+  still gets repeated dozens of times each -- teaching the model to
+  over-memorize a handful of specific people rather than the general skill.
+  When the cap makes the target frac unreachable, the printed `achieved`
+  falls honestly short of it rather than over-duplicating to compensate --
+  process more raw calls (a higher `build_dataset.py --max-calls`, or none
+  at all) for a larger, more diverse distinct-entity pool instead of raising
+  the cap.
 
 Point `dataset_id` in your config at this curated file, not the raw one from
 step 1.
@@ -299,8 +324,56 @@ triggers a generation pass over that dataset: the model corrects each
   TensorBoard as `test_wer`/`test_exact_match`/`test_hallucination_rate`, so
   you get curves over training steps, not just final numbers.
 
-Use `test.max_examples` to cap the test set for faster per-checkpoint checks
-if the full set is slow to run repeatedly.
+`test.repetition_penalty` (default `1.2`) and `test.no_repeat_ngram_size`
+(default `3`) guard against a real, observed failure of plain greedy
+decoding (`do_sample=False`): a short, locally-high-probability phrase --
+e.g. this task's "بله" (yes) agreement-word bursts, which do occur
+naturally as short runs in real training segments -- can trigger a runaway
+repeat loop that never finds the actual stopping point and just fills
+`max_new_tokens`. On this task's first fine-tuned checkpoints, this hit
+roughly 1 in 6-7 test examples and single-handedly dragged the aggregate
+`wer`/`hallucination_rate` far worse than the untrained baseline, even
+though the ~85% of predictions that didn't degenerate were good corrections.
+Set either to `1.0`/`0` to disable.
+
+`test.max_examples` caps the *baseline* (below) and *final* evals -- each
+only runs once per training run, so leaving it `null` (the full test set) is
+usually worth the time for an accurate number. `test.checkpoint_max_examples`
+is a separate, usually much smaller cap for the *repeated* per-checkpoint
+eval: with a frequent `eval_steps`/`save_steps` that can fire hundreds of
+times over a run, so running the full set there every time multiplies eval
+cost far beyond training itself -- both `qwen3.5-2b.yaml`/`gemma-3-1b-it.yaml`
+set this to `150`. `null` (the default) falls back to `test.max_examples`
+(no separate cap).
+
+Generation is also the one place `test.batch_size` (default `8`, raised to
+`16` in the two active configs) matters independently of training's own
+batch size -- and unlike a standalone `evaluate.py` CLI run, the
+per-checkpoint eval runs *inside* the training process's existing GPU
+footprint (LoRA + optimizer state already resident), so watch for OOM
+specifically during a checkpoint save, not just training steps, before
+pushing it higher.
+
+This isn't just a theoretical caveat: with `batch_size: 16`, generation's
+KV-cache churn (allocating/freeing many differently-sized tensors as
+sequences grow token-by-token) fragmented PyTorch's CUDA allocator badly
+enough to OOM the *training* step right after the first checkpoint eval,
+reproduced identically on two separate runs on a 32GB RTX 5090 -- not a raw
+capacity problem (the error showed several GiB "reserved but unallocated"
+that a single large backward-pass allocation couldn't use). `run_test_eval()`
+now calls `torch.cuda.empty_cache()` right after generation to release that
+back before training resumes, and `run.sh` sets
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` as further mitigation. If
+OOM recurs anyway, `test.batch_size` is the first thing to dial back down.
+
+If a model's `transformers` warns about `causal_conv1d`/
+`chunk_gated_delta_rule` falling back to a reference PyTorch implementation
+(seen with Qwen3.5's hybrid SSM/linear-attention layers), that slows down
+both training and every generation pass here. `run.sh` best-effort installs
+`causal-conv1d`/`flash-linear-attention` to fix it (see `requirements.txt`)
+-- best-effort because they're CUDA/torch-version-sensitive compiled
+extensions, not guaranteed to build on every image, so a failure there
+doesn't abort the rest of the script.
 
 ### Baseline (pre-fine-tuning) evaluation
 
@@ -316,6 +389,36 @@ automatically on a resumed run (`resume_from_checkpoint` set) -- the original
 run already captured this -- or set `test.baseline: false` to skip it
 otherwise (e.g. re-running several `train_fraction` ablations of the same
 model, where the baseline would be identical every time).
+
+### Named-entity eval slice
+
+Aggregate WER on the full test set mixes entity-heavy and entity-free calls
+together, which hides exactly the failure mode this task's system prompt
+cares about most -- person/place/order-name correction -- inside a number
+dominated by everything else (found by direct investigation: on this task's
+first fine-tuned checkpoints, dozens of "rare word" fixes turned out on
+inspection to be dictation-form corrections like word-boundary merges or
+stutters, not actual named-entity corrections, while several confirmed real
+name mishearings -- e.g. an agent's own name misheard as a filler phrase --
+went uncorrected).
+
+```bash
+python src/build_entity_eval_slice.py --output data/entity_eval_slice.jsonl
+```
+
+`callcc-test-1k` carries `crm_metadata` (the real CRM record) on every row.
+This cross-references the customer's real name and the CRM record's
+`owner_name` (usually the agent, in Persian -- `crm.agent.name` is Latin
+script and won't match transcript text) against the reference transcript,
+keeping only rows where a confirmed real name-word actually appears in it --
+so you know for certain a genuine named entity is in play, not a rare-word
+heuristic guess. Point `test.entity_dataset_id` at the output to run it
+alongside the main test set at baseline/every checkpoint/final, reusing
+every other `test.*` generation setting: results land under
+`test_eval_entity/` (`test_eval_entity_baseline/` for the pre-training pass)
+and log to TensorBoard as `test_entity_wer`/`test_entity_wer_zwnj_normalized`/
+`test_entity_exact_match`/`test_entity_hallucination_rate`, tracked
+separately from the main `test_*` curves throughout training.
 
 ### Best checkpoint by WER
 
