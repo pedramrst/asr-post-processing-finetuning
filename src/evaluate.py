@@ -27,7 +27,7 @@ from tqdm import tqdm
 from transformers import TrainerCallback
 from transformers.trainer import PREFIX_CHECKPOINT_DIR
 
-from data import SYSTEM_PROMPT, load_local_jsonl_columns
+from data import SYSTEM_PROMPT, load_local_jsonl_columns, resolve_system_prompt
 
 load_dotenv()
 
@@ -302,6 +302,44 @@ def update_best_checkpoint(output_dir: str, source_dir: str, metrics: dict, step
     return True, metrics["wer"]
 
 
+def run_secondary_eval(model, tokenizer, cfg, dataset_id: str | None, name: str, output_subdir: str, trainer=None):
+    """Runs run_test_eval() against one of cfg's secondary datasets (e.g.
+    test_entity_dataset_id, test_typo_dataset_id) -- a no-op returning None
+    if `dataset_id` is unset. Shared by TestEvalCallback and train.py's
+    baseline/final eval blocks so adding another named slice (beyond entity
+    and typo) doesn't mean copy-pasting a fourth near-identical block.
+
+    Writes to <output_dir>/<output_subdir>/, reusing every other test.*
+    generation setting from cfg. If `trainer` is given, logs
+    test_<name>_wer/wer_zwnj_normalized/exact_match/hallucination_rate.
+    """
+    if not dataset_id:
+        return None
+    metrics = run_test_eval(
+        model,
+        tokenizer,
+        dataset_id=dataset_id,
+        input_column=cfg.test_input_column,
+        target_column=cfg.test_target_column,
+        output_path=str(Path(cfg.output_dir) / output_subdir / "predictions.jsonl"),
+        system_prompt=resolve_system_prompt(cfg),
+        split=cfg.test_split,
+        max_new_tokens=cfg.test_max_new_tokens,
+        batch_size=cfg.test_batch_size,
+        hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+        repetition_penalty=cfg.test_repetition_penalty,
+        no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
+    )
+    if trainer is not None and metrics["wer"] is not None:
+        trainer.log({
+            f"test_{name}_wer": metrics["wer"],
+            f"test_{name}_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
+            f"test_{name}_exact_match": metrics["exact_match"],
+            f"test_{name}_hallucination_rate": metrics["hallucination_rate"],
+        })
+    return metrics
+
+
 class TestEvalCallback(TrainerCallback):
     """Runs run_test_eval() on every checkpoint save; logs WER to TensorBoard.
 
@@ -339,7 +377,7 @@ class TestEvalCallback(TrainerCallback):
             input_column=self.cfg.test_input_column,
             target_column=self.cfg.test_target_column,
             output_path=str(Path(self.cfg.output_dir) / "test_eval" / "predictions.jsonl"),
-            system_prompt=self.cfg.system_prompt or SYSTEM_PROMPT,
+            system_prompt=resolve_system_prompt(self.cfg),
             split=self.cfg.test_split,
             max_new_tokens=self.cfg.test_max_new_tokens,
             batch_size=self.cfg.test_batch_size,
@@ -363,29 +401,14 @@ class TestEvalCallback(TrainerCallback):
                 log_values["test_best_wer"] = best_wer
             self.trainer.log(log_values)
 
-        if self.cfg.test_entity_dataset_id:
-            entity_metrics = run_test_eval(
-                self.model,
-                self.tokenizer,
-                dataset_id=self.cfg.test_entity_dataset_id,
-                input_column=self.cfg.test_input_column,
-                target_column=self.cfg.test_target_column,
-                output_path=str(Path(self.cfg.output_dir) / "test_eval_entity" / "predictions.jsonl"),
-                system_prompt=self.cfg.system_prompt or SYSTEM_PROMPT,
-                split=self.cfg.test_split,
-                max_new_tokens=self.cfg.test_max_new_tokens,
-                batch_size=self.cfg.test_batch_size,
-                hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
-                repetition_penalty=self.cfg.test_repetition_penalty,
-                no_repeat_ngram_size=self.cfg.test_no_repeat_ngram_size,
-            )
-            if self.trainer is not None and entity_metrics["wer"] is not None:
-                self.trainer.log({
-                    "test_entity_wer": entity_metrics["wer"],
-                    "test_entity_wer_zwnj_normalized": entity_metrics["wer_zwnj_normalized"],
-                    "test_entity_exact_match": entity_metrics["exact_match"],
-                    "test_entity_hallucination_rate": entity_metrics["hallucination_rate"],
-                })
+        run_secondary_eval(
+            self.model, self.tokenizer, self.cfg, self.cfg.test_entity_dataset_id,
+            "entity", "test_eval_entity", self.trainer,
+        )
+        run_secondary_eval(
+            self.model, self.tokenizer, self.cfg, self.cfg.test_typo_dataset_id,
+            "typo", "test_eval_typo", self.trainer,
+        )
 
 
 def _cli() -> None:

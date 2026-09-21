@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
@@ -31,8 +32,8 @@ from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
 from config import Config, load_config
-from data import SYSTEM_PROMPT, PadCollator, build_example, load_sft_dataset
-from evaluate import TestEvalCallback, run_test_eval, update_best_checkpoint
+from data import PadCollator, build_example, load_sft_dataset, resolve_system_prompt
+from evaluate import TestEvalCallback, run_secondary_eval, run_test_eval, update_best_checkpoint
 from hub_sync import SyncToHubCallback, repo_folder_name, sync_output_dir
 
 load_dotenv()
@@ -65,6 +66,41 @@ def _parse_overrides(raw_overrides: list[str]) -> dict:
         else:
             overrides[key] = parsed_value
     return overrides
+
+
+# Known punctuated/punctuation-free target column names across the datasets
+# this pipeline actually touches -- text_soniox (our own curated data),
+# text_raw (ErfanRou/callcc-test-1k and the entity/typo eval slices), text
+# (the punctuation-free default everywhere). Not exhaustive for an arbitrary
+# custom dataset_id, just a sanity net for the common case.
+_PUNCTUATED_COLUMNS = ("text_soniox", "text_raw")
+_UNPUNCTUATED_COLUMNS = ("text",)
+
+
+def warn_if_punctuation_flag_inconsistent(cfg: Config) -> None:
+    """include_punctuation only swaps the system prompt -- target_column/
+    test_target_column are set independently (the punctuated column has a
+    different name per dataset), so it's easy to flip one and forget the
+    other. That silently trains/evaluates against a system prompt that
+    contradicts the actual target shape, so this warns (doesn't raise) at
+    startup for the common, recognized column names.
+    """
+    for label, column in [("target_column", cfg.target_column), ("test_target_column", cfg.test_target_column)]:
+        if cfg.include_punctuation and column in _UNPUNCTUATED_COLUMNS:
+            print(
+                f"WARNING: include_punctuation is true but {label}={column!r} looks "
+                "punctuation-free -- did you mean text_soniox (local curated data) or "
+                "text_raw (Hub datasets/eval slices)?",
+                file=sys.stderr,
+            )
+        elif not cfg.include_punctuation and column in _PUNCTUATED_COLUMNS:
+            print(
+                f"WARNING: {label}={column!r} looks punctuated but include_punctuation "
+                "is false -- the system prompt will still say not to add punctuation, "
+                "contradicting the training/eval target. Set include_punctuation: true "
+                "to match.",
+                file=sys.stderr,
+            )
 
 
 def resolve_resume_checkpoint(cfg: Config) -> bool | str | None:
@@ -102,6 +138,7 @@ def main() -> None:
         raise ValueError("hub.push_to_hub is true but hub.repo_id is not set.")
     if cfg.on_long_example not in ("drop", "truncate"):
         raise ValueError(f"on_long_example must be 'drop' or 'truncate', got {cfg.on_long_example!r}")
+    warn_if_punctuation_flag_inconsistent(cfg)
 
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -164,16 +201,16 @@ def main() -> None:
         print(f"train_fraction={cfg.train_fraction}: using {len(raw['train'])} train rows")
 
     length_stats = Counter()
+    system_prompt = resolve_system_prompt(cfg)
 
     def _map(example):
-        kwargs = {} if cfg.system_prompt is None else {"system_prompt": cfg.system_prompt}
         result = build_example(
             tokenizer,
             example[cfg.input_column],
             example[cfg.target_column],
             max_length=cfg.max_length,
             on_long_example=cfg.on_long_example,
-            **kwargs,
+            system_prompt=system_prompt,
         )
         length_stats[result["status"]] += 1
         return result
@@ -256,7 +293,7 @@ def main() -> None:
             input_column=cfg.test_input_column,
             target_column=cfg.test_target_column,
             output_path=str(output_dir / "test_eval_baseline" / "predictions.jsonl"),
-            system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
+            system_prompt=resolve_system_prompt(cfg),
             split=cfg.test_split,
             max_new_tokens=cfg.test_max_new_tokens,
             batch_size=cfg.test_batch_size,
@@ -275,31 +312,14 @@ def main() -> None:
                 "test_hallucination_rate": baseline_metrics["hallucination_rate"],
             })
 
-        if cfg.test_entity_dataset_id:
-            baseline_entity_metrics = run_test_eval(
-                model,
-                tokenizer,
-                dataset_id=cfg.test_entity_dataset_id,
-                input_column=cfg.test_input_column,
-                target_column=cfg.test_target_column,
-                output_path=str(output_dir / "test_eval_entity_baseline" / "predictions.jsonl"),
-                system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
-                split=cfg.test_split,
-                max_new_tokens=cfg.test_max_new_tokens,
-                batch_size=cfg.test_batch_size,
-                hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
-                repetition_penalty=cfg.test_repetition_penalty,
-                no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
-            )
-            print(f"Baseline (entity slice): wer={baseline_entity_metrics['wer']}, "
-                  f"exact_match={baseline_entity_metrics['exact_match']}")
-            if baseline_entity_metrics["wer"] is not None:
-                trainer.log({
-                    "test_entity_wer": baseline_entity_metrics["wer"],
-                    "test_entity_wer_zwnj_normalized": baseline_entity_metrics["wer_zwnj_normalized"],
-                    "test_entity_exact_match": baseline_entity_metrics["exact_match"],
-                    "test_entity_hallucination_rate": baseline_entity_metrics["hallucination_rate"],
-                })
+        for name, ds_id, subdir in [
+            ("entity", cfg.test_entity_dataset_id, "test_eval_entity_baseline"),
+            ("typo", cfg.test_typo_dataset_id, "test_eval_typo_baseline"),
+        ]:
+            secondary_metrics = run_secondary_eval(model, tokenizer, cfg, ds_id, name, subdir, trainer)
+            if secondary_metrics is not None:
+                print(f"Baseline ({name} slice): wer={secondary_metrics['wer']}, "
+                      f"exact_match={secondary_metrics['exact_match']}")
 
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(cfg.output_dir)
@@ -316,7 +336,7 @@ def main() -> None:
             input_column=cfg.test_input_column,
             target_column=cfg.test_target_column,
             output_path=str(output_dir / "test_eval" / "predictions.jsonl"),
-            system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
+            system_prompt=resolve_system_prompt(cfg),
             split=cfg.test_split,
             max_new_tokens=cfg.test_max_new_tokens,
             batch_size=cfg.test_batch_size,
@@ -331,22 +351,8 @@ def main() -> None:
         # subdirectory of itself.
         update_best_checkpoint(cfg.output_dir, cfg.output_dir, final_metrics, trainer.state.global_step)
 
-        if cfg.test_entity_dataset_id:
-            run_test_eval(
-                model,
-                tokenizer,
-                dataset_id=cfg.test_entity_dataset_id,
-                input_column=cfg.test_input_column,
-                target_column=cfg.test_target_column,
-                output_path=str(output_dir / "test_eval_entity" / "predictions.jsonl"),
-                system_prompt=cfg.system_prompt or SYSTEM_PROMPT,
-                split=cfg.test_split,
-                max_new_tokens=cfg.test_max_new_tokens,
-                batch_size=cfg.test_batch_size,
-                hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
-                repetition_penalty=cfg.test_repetition_penalty,
-                no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
-            )
+        run_secondary_eval(model, tokenizer, cfg, cfg.test_entity_dataset_id, "entity", "test_eval_entity")
+        run_secondary_eval(model, tokenizer, cfg, cfg.test_typo_dataset_id, "typo", "test_eval_typo")
     if cfg.push_to_hub:
         sync_output_dir(cfg, commit_message="final")
 

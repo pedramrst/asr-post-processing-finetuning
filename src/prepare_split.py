@@ -35,12 +35,21 @@ Applies four fixes, based on inspecting an actual sample of the raw data:
      dictation-form errors (stutters, word-boundary merges, ZWNJ) but had
      zero confirmed successes on an actually mis-heard name in a small
      sample, despite a much higher hit rate on generic rare words. Detection
-     reuses build_dataset.py's `crm_context` (the real CRM record for that
-     call, only ever present on assembled rows) the same way
-     build_entity_eval_slice.py does for the eval slice: a row counts as
-     "entity" if the CRM customer name or case-owner name has a word that
-     actually appears in the target text -- i.e. a confirmed real entity,
-     not a rare-word heuristic guess. --entity-max-repeats caps how many
+     detection combines two signals, either one qualifying a row: (a)
+     build_dataset.py's `crm_context` (the real CRM record for that call) --
+     a row counts as "entity" if the CRM customer name or case-owner name has
+     a word that actually appears in the target text, same as
+     build_entity_eval_slice.py's eval-slice detection; and (b)
+     build_dataset.py's `word_confidence` (Soniox's own per-word confidence,
+     reconstructed from the tokens/ shards) -- a word confident enough below
+     --entity-confidence-max, also long/rare enough (see
+     --entity-confidence-max-freq) to plausibly be a name rather than
+     ordinary ASR noise on a common word. (b) matters because CRM data only
+     covers ~25% of calls; confidence exists on every call, and was verified
+     directly to be a real (if noisier) proxy: confirmed CRM entity words
+     average 0.798 confidence vs. 0.917 for other words. Both signals are
+     assembled-row-only (chunked rows carry neither field).
+     --entity-max-repeats caps how many
      times any single row can be duplicated to get there: distinct customer
      names scale roughly linearly with how many raw calls you process (real
      measurement: ~324 distinct names per 6,000 calls), but --entity-target-
@@ -62,6 +71,7 @@ Example:
 import argparse
 import json
 import random
+from collections import Counter
 import re
 import sys
 
@@ -89,7 +99,23 @@ def parse_args():
                          "detection method) in the final output. Only assembled rows ever carry crm_context, "
                          "so this only ever finds/upsamples within that pool. 0 disables it.")
     p.add_argument("--entity-min-name-word-len", type=int, default=3,
-                    help="Minimum character length for a CRM name word to count as a match.")
+                    help="Minimum character length for a CRM or low-confidence name-candidate word to "
+                         "count as a match.")
+    p.add_argument("--entity-confidence-max", type=float, default=0.3,
+                    help="A word's Soniox confidence (build_dataset.py's word_confidence) has to be below "
+                         "this -- well under build_dataset.py's own storage cutoff (default 0.8) -- to "
+                         "count as a confidence-based entity candidate. Tuned against real data: 0.5 still "
+                         "flagged ~44%% of assembled rows as 'entity'; 0.3 (combined with "
+                         "--entity-confidence-max-freq) landed at ~16%%. Going this low trades away some "
+                         "precision differently than higher confidence ranges do -- a sample at this "
+                         "threshold was a real mix of genuine hard-to-transcribe words and cases where "
+                         "Soniox itself, not just Whisper, may be unreliable (unlike the 0.5-0.8 range, "
+                         "verified to still usually be correct even when unsure).")
+    p.add_argument("--entity-confidence-max-freq", type=int, default=1,
+                    help="A confidence-based entity candidate also has to occur at most this many times "
+                         "across the whole pool being curated -- confidence and length alone still aren't "
+                         "a strong enough filter, since Persian's morphology means plenty of non-entity "
+                         "word forms are also locally rare.")
     p.add_argument("--entity-max-repeats", type=int, default=5,
                     help="Cap on how many times any single confirmed-entity row can be duplicated when "
                          "upsampling -- without this, a small distinct-entity pool relative to "
@@ -118,14 +144,64 @@ def persian_name_words(crm: dict, min_len: int) -> set[str]:
     return words
 
 
-def is_entity_row(row: dict, min_len: int) -> bool:
+def crm_entity_words(row: dict, min_len: int) -> set[str]:
+    """CRM-confirmed real customer/agent name words actually present in the
+    target text -- see persian_name_words()."""
     crm = row.get("crm_context")
     if not crm:
-        return False
+        return set()
     name_words = persian_name_words(crm, min_len)
-    if not name_words:
-        return False
-    return bool(name_words & set(row["text"].split()))
+    return name_words & set(row["text"].split()) if name_words else set()
+
+
+def confidence_entity_words(
+    row: dict, min_len: int, max_confidence: float, corpus_freq: Counter, max_freq: int
+) -> set[str]:
+    """Low-Soniox-confidence words (build_dataset.py's word_confidence) that
+    are also long and rare enough to plausibly be a name rather than
+    ordinary ASR noise on a common word.
+
+    Verified directly against real data: words matching a confirmed CRM
+    entity average 0.798 confidence vs. 0.917 for other words, and Soniox's
+    low-confidence guess is still usually right where Whisper is completely
+    wrong (e.g. a misspelled surname scored 0.51 next to two correctly
+    spelled instances of the same name at 0.76/0.96) -- so low confidence is
+    a real, if noisy, proxy for "probably a name or hard term," and unlike
+    crm_entity_words() it isn't limited to the ~25% of calls with CRM data.
+
+    Getting a usable threshold took real tuning, not just picking a number:
+    build_dataset.py's storage cutoff (0.8) alone flagged ~100% of assembled
+    rows once combined with a length gate, since some word in a long
+    transcript almost always dips that low by chance. Adding a rarity gate
+    (a word also has to occur <= max_freq times across the whole pool being
+    curated, via corpus_freq from word_frequency()) still left 50-70% of
+    rows flagged even at 3,000-call scale, because Persian's morphology
+    means plenty of non-entity word *forms* are also locally rare. Tightening
+    `max_confidence` well below the storage cutoff (this function's own
+    threshold, independent of what got stored) is what actually separates
+    the signal -- see README for the achieved rate this lands on.
+    """
+    candidates = {
+        w for w, conf in (row.get("word_confidence") or {}).items()
+        if conf < max_confidence and len(w) >= min_len and corpus_freq.get(w, 0) <= max_freq
+    }
+    return candidates & set(row["text"].split()) if candidates else set()
+
+
+def word_frequency(rows: list) -> Counter:
+    freq = Counter()
+    for r in rows:
+        freq.update(r["text"].split())
+    return freq
+
+
+def is_entity_row(
+    row: dict, min_len: int, max_confidence: float, corpus_freq: Counter, max_freq: int
+) -> bool:
+    return bool(
+        crm_entity_words(row, min_len)
+        or confidence_entity_words(row, min_len, max_confidence, corpus_freq, max_freq)
+    )
 
 
 def load_rows(path):
@@ -217,12 +293,25 @@ def main():
     )
 
     # Entity upsampling runs last, over the whole post-balance pool -- only
-    # assembled rows can ever match (chunked rows never carry crm_context),
-    # so this can't disturb the assembled/chunked ratio just established
-    # above by pulling additional rows from the chunked side.
+    # assembled rows can ever match (chunked rows never carry crm_context or
+    # word_confidence), so this can't disturb the assembled/chunked ratio
+    # just established above by pulling additional rows from the chunked
+    # side.
+    entity_pool = chunked_final + assembled_final
+    corpus_freq = word_frequency(entity_pool)
     entity_rows, non_entity_rows = [], []
-    for r in chunked_final + assembled_final:
-        (entity_rows if is_entity_row(r, args.entity_min_name_word_len) else non_entity_rows).append(r)
+    n_crm_matched = n_confidence_matched = 0
+    for r in entity_pool:
+        crm_hit = bool(crm_entity_words(r, args.entity_min_name_word_len))
+        conf_hit = bool(confidence_entity_words(
+            r, args.entity_min_name_word_len, args.entity_confidence_max,
+            corpus_freq, args.entity_confidence_max_freq,
+        ))
+        if crm_hit:
+            n_crm_matched += 1
+        if conf_hit:
+            n_confidence_matched += 1
+        (entity_rows if (crm_hit or conf_hit) else non_entity_rows).append(r)
 
     e_frac = args.entity_target_frac
     if e_frac <= 0 or not entity_rows:
@@ -266,6 +355,9 @@ def main():
     print(f"confirmed-entity rows: {len(entity_rows)} -> upsampled to {len(entity_final)} "
           f"(target frac {e_frac}, achieved {entity_achieved:.3f}, avg {avg_repeats:.1f}x repeats per row, "
           f"cap {args.entity_max_repeats}x){capped_note}", file=sys.stderr)
+    print(f"  by source: {n_crm_matched} via CRM (customer/agent name confirmed), "
+          f"{n_confidence_matched} via low Soniox confidence on a rare word "
+          f"({n_crm_matched + n_confidence_matched - len(entity_rows)} matched both)", file=sys.stderr)
     print(f"final rows written to {args.output}: {len(final_rows)}", file=sys.stderr)
 
 

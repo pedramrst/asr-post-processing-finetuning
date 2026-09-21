@@ -26,6 +26,35 @@ SYSTEM_PROMPT = (
     "-- no explanation, no extra text."
 )
 
+# Same task, but for training/eval against a punctuated target (e.g. text_soniox
+# in our own curated data, text_raw on the ErfanRou/callcc-test-1k Hub dataset)
+# instead of the default punctuation-free text -- see Config.include_punctuation.
+# Whisper's own output (text_whisper, this model's actual input) never has
+# punctuation, so this is a strictly harder version of the task: no acoustic
+# pause/prosody cues survive into the text the model actually sees, unlike
+# whatever produced the punctuated reference in the first place.
+SYSTEM_PROMPT_WITH_PUNCTUATION = SYSTEM_PROMPT.replace(
+    "and use correct Persian ZWNJ half-spacing for compound words. Do not add "
+    "punctuation, and write numbers as words, not digits.",
+    "use correct Persian ZWNJ half-spacing for compound words, and add "
+    "appropriate Persian punctuation (commas, periods, question marks) where "
+    "the sentence structure calls for it, but write numbers as words, not digits.",
+)
+
+
+def resolve_system_prompt(cfg) -> str:
+    """The system prompt actually used for a run: cfg.system_prompt if set
+    explicitly, else the punctuation-aware or punctuation-free default
+    depending on cfg.include_punctuation. Centralized so every call site
+    (training's tokenization, baseline/checkpoint/final eval, the entity/typo
+    secondary evals) picks the same prompt for the same config -- a run
+    training on a punctuated target but evaluating with the punctuation-free
+    prompt (or vice versa) would silently teach/measure the wrong thing.
+    """
+    if cfg.system_prompt:
+        return cfg.system_prompt
+    return SYSTEM_PROMPT_WITH_PUNCTUATION if cfg.include_punctuation else SYSTEM_PROMPT
+
 
 def load_local_jsonl_columns(path: str, columns: list[str]) -> Dataset:
     """Reads a local .jsonl file, keeping only `columns`.

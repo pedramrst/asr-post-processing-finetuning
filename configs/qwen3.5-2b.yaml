@@ -87,5 +87,9 @@ test:
   # "Named-entity eval slice". Tracked separately (test_entity_wer etc.) so
   # weak entity correction can't hide inside the aggregate test_wer number.
   entity_dataset_id: ./data/entity_eval_slice.jsonl
+  # 358-row typo/dictation-form regression-guard slice -- see
+  # src/build_typo_eval_slice.py. Tracks that entity upsampling doesn't
+  # quietly erode the dictation-error correction that already works well.
+  typo_dataset_id: ./data/typo_eval_slice.jsonl
 
 resume_from_checkpoint: false

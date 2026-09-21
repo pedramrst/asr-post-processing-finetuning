@@ -57,6 +57,7 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "no_repeat_ngram_size": "test_no_repeat_ngram_size",
         "baseline": "test_baseline",
         "entity_dataset_id": "test_entity_dataset_id",
+        "typo_dataset_id": "test_typo_dataset_id",
     },
 }
 
@@ -79,6 +80,17 @@ class Config:
     input_column: str = "text_whisper"
     target_column: str = "text"
     system_prompt: str | None = None
+    # Feature flag for training/eval against a punctuated target instead of
+    # the default punctuation-free `text` -- see data.py's
+    # SYSTEM_PROMPT_WITH_PUNCTUATION and README's "Punctuation" section. Only
+    # swaps the system prompt (unless system_prompt is set explicitly, which
+    # always wins) -- it does NOT change target_column/test_target_column,
+    # since the punctuated column has a different name depending on the
+    # dataset (text_soniox in our own curated data, text_raw on
+    # ErfanRou/callcc-test-1k and the entity/typo eval slices); set those
+    # explicitly alongside this. train.py warns at startup if this and
+    # target_column look inconsistent with each other.
+    include_punctuation: bool = False
 
     output_dir: str = "./outputs/run"
     max_length: int = 512
@@ -182,6 +194,15 @@ class Config:
     # test.* generation setting (input/target column, batch size,
     # repetition_penalty, ...); null skips this entirely.
     test_entity_dataset_id: str | None = None
+    # Same idea as test_entity_dataset_id, but for typo/dictation-form
+    # errors (stutters, word-boundary merges, ZWNJ half-spacing) instead of
+    # named entities -- see build_typo_eval_slice.py. Results under
+    # test_eval_typo/ etc., logged as test_typo_wer/... . This is a
+    # regression guard, not an improvement target: direct investigation
+    # found the model already handles this error category well, so the
+    # point of tracking it is catching if pushing harder on entity
+    # correction (prepare_split.py's entity upsampling) quietly erodes it.
+    test_typo_dataset_id: str | None = None
 
 
 def _flatten(raw: dict[str, Any]) -> dict[str, Any]:

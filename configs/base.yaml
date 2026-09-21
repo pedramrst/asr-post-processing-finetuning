@@ -19,6 +19,12 @@ train_fraction: null
 input_column: text_whisper
 target_column: text
 system_prompt: null   # null -> use the default prompt in data.py
+# Feature flag to test training/eval against a punctuated target instead of
+# the punctuation-free default -- see README's "Punctuation" section. Only
+# swaps the system prompt; target_column/test.target_column need to be set
+# explicitly too (text_soniox locally, text_raw on Hub datasets/eval
+# slices), since the punctuated column has a different name per dataset.
+include_punctuation: false
 
 output_dir: ./outputs/qwen3-1.7b-base
 # 512 was fine for chunked-only training; assembled rows are now per-channel
@@ -90,6 +96,12 @@ test:
   # which hides weak named-entity correction inside a number dominated by
   # everything else. null skips this entirely.
   entity_dataset_id: null
+  # Same idea, for typo/dictation-form errors (stutters, word-boundary
+  # merges, ZWNJ) instead of named entities -- see
+  # src/build_typo_eval_slice.py. A regression guard, not an improvement
+  # target: the model already handles this error category well, so the
+  # point is catching if pushing harder on entities erodes it.
+  typo_dataset_id: null
 
 # false | true (resume from the latest checkpoint under output_dir) |
 # a local checkpoint path | "hub" to pull this run's folder from hub.repo_id first

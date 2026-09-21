@@ -52,11 +52,28 @@ Flags:
   --max-calls INT            Optional. Stop after this many calls (testing).
   --max-shards INT           Optional. Only scan this many shard files
                             (testing).
+  --low-confidence-threshold FLOAT
+                            Optional, default 0.8. A generous storage cutoff,
+                            not a detection threshold: an assembled row's
+                            word_confidence records every word below this
+                            from the tokens/ shards (Soniox's own per-token
+                            confidence, reconstructed to word level), and
+                            prepare_split.py decides the real cutoff from
+                            there without needing to rebuild this if it needs
+                            tuning. Verified directly: words matching a
+                            confirmed CRM entity average 0.798 confidence
+                            here vs. 0.917 for other words, and Soniox's
+                            *lower*-confidence guess is still usually right
+                            where Whisper is completely wrong -- so this is
+                            a broader, CRM-independent proxy for "probably a
+                            name or hard term," usable on every call, not
+                            just the ~25% with CRM data.
 
 Example:
   python3 src/build_dataset.py --assembled-ratio 0.9
 """
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -90,11 +107,65 @@ def parse_args():
                          "If omitted, defaults to ./asr_dataset_<timestamp>.jsonl")
     p.add_argument("--max-calls", type=int, default=None, help="Cap total calls processed (testing).")
     p.add_argument("--max-shards", type=int, default=None, help="Cap number of shard files scanned (testing).")
+    p.add_argument("--low-confidence-threshold", type=float, default=0.8,
+                    help="Soniox per-word confidence below this is recorded (with its actual value) in "
+                         "an assembled row's word_confidence -- see the module docstring for why.")
     return p.parse_args()
 
 
 def list_shard_paths(fs):
     return sorted(fs.glob(f"datasets/{HF_REPO_ID}/data/*.parquet"))
+
+
+def list_token_shard_paths(fs):
+    """tokens/*.jsonl.gz shards -- verified 1:1 index-aligned with list_shard_paths()'s
+    data/*.parquet shards (same count, same call_ids per matching index)."""
+    return sorted(fs.glob(f"datasets/{HF_REPO_ID}/tokens/*.jsonl.gz"))
+
+
+def read_token_shard(fs, path, threshold):
+    """Returns {call_id: {channel_str: {word: min_confidence}}} for words
+    below `threshold` in that channel.
+
+    Soniox's tokens/ shards are sub-word (a name like "کاویان" arrives as
+    "کا"+"وی"+"ان"), not word-level -- a new token starting with a literal
+    leading space marks a new word boundary, so words are reconstructed by
+    grouping consecutive tokens on that boundary, taking the *minimum*
+    confidence across a word's sub-word tokens (one weak piece is enough to
+    make the whole word suspect, as seen directly: a misspelled surname's
+    weak sub-token pulled its word confidence down to 0.51 while correctly
+    spelled instances of the same name stayed above 0.76).
+
+    Keeps the actual confidence value, not just below-threshold membership:
+    `threshold` here is a generous storage cutoff (keep the field a
+    reasonable size), not the real detection threshold -- that decision
+    belongs downstream (prepare_split.py), and needs the real number to
+    tune without re-running this whole build. Verified directly: a
+    membership-only cutoff at 0.8 combined with rarity filtering still
+    flagged 50-70% of assembled rows as "entity" even at 3,000-call scale,
+    so getting this right took more than one threshold guess.
+    """
+    with fs.open(path, "rb") as f:
+        raw = gzip.decompress(f.read())
+    result = {}
+    for line in raw.decode("utf-8").splitlines():
+        rec = json.loads(line)
+        by_channel = {}
+        for channel, chan_data in rec.get("channels", {}).items():
+            words, cur, cur_confs = [], "", []
+            for t in chan_data.get("tokens", []):
+                if t["text"].startswith(" ") or not cur:
+                    if cur:
+                        words.append((cur.strip(".,،؟!"), min(cur_confs)))
+                    cur, cur_confs = t["text"].lstrip(), [t["conf"]]
+                else:
+                    cur += t["text"]
+                    cur_confs.append(t["conf"])
+            if cur:
+                words.append((cur.strip(".,،؟!"), min(cur_confs)))
+            by_channel[channel] = {w: round(c, 4) for w, c in words if w and c < threshold}
+        result[rec["call_id"]] = by_channel
+    return result
 
 
 def read_remote_table(fs, path, columns):
@@ -155,8 +226,17 @@ def main():
     crm_map, expected_segs = load_crm_and_expected(fs)
 
     files = list_shard_paths(fs)
+    token_files = list_token_shard_paths(fs)
+    if len(files) != len(token_files):
+        print(
+            f"WARNING: data/ has {len(files)} shards but tokens/ has {len(token_files)} -- "
+            "index-based pairing (verified 1:1 at the time this script was written) may be "
+            "stale; word_confidence will be skipped where the pairing is wrong.",
+            file=sys.stderr,
+        )
     if args.max_shards:
         files = files[: args.max_shards]
+        token_files = token_files[: args.max_shards]
 
     stats = Counter()
     stop = False
@@ -168,11 +248,16 @@ def main():
     print(f"Writing to {output_path}", file=sys.stderr)
     with open(output_path, "w", encoding="utf-8") as out_f:
         pbar = tqdm(files, desc="shards", unit="shard")
-        for fp in pbar:
+        for shard_idx, fp in enumerate(pbar):
             if stop:
                 break
             tbl = read_remote_table(fs, fp, SEG_COLS)
             rows = tbl.to_pylist()
+            token_map = (
+                read_token_shard(fs, token_files[shard_idx], args.low_confidence_threshold)
+                if shard_idx < len(token_files)
+                else {}
+            )
             by_call = defaultdict(list)
             for r in rows:
                 by_call[r["call_id"]].append(r)
@@ -222,6 +307,9 @@ def main():
                         conf_means = [s["conf_mean"] for s in chan_sorted if s["conf_mean"] is not None]
                         conf_mins = [s["conf_min"] for s in chan_sorted if s["conf_min"] is not None]
                         wers = [s["wer_whisper"] for s in chan_sorted if s["wer_whisper"] is not None]
+                        # JSON object keys (tokens/ shards) are always strings, unlike
+                        # `channel` here (parquet int) -- str() to match.
+                        word_confidence = token_map.get(call_id, {}).get(str(channel), {})
 
                         row_out = {
                             "call_id": call_id,
@@ -238,6 +326,7 @@ def main():
                             "overlap_pct": ov,
                             "crm_context": crm_context,
                             "seg_count_matches_meta": seg_count_matches_meta,
+                            "word_confidence": word_confidence,
                         }
                         out_f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
                         stats["rows_assembled"] += 1
@@ -261,6 +350,10 @@ def main():
                             "word_diff_pct": wd,
                             "overlap_pct": ov,
                             "crm_context": None,
+                            # Not computed for chunked rows -- see word_confidence's
+                            # docstring note in read_token_shard(); always {} here, same
+                            # reasoning as crm_context always being None here.
+                            "word_confidence": {},
                         }
                         out_f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
                         stats["rows_chunked"] += 1

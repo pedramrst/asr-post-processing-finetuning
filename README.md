@@ -68,7 +68,12 @@ build_dataset.py       (in src/) downloads + preprocesses callcc-2k into a
                         local .jsonl, column-pruned so audio is never fetched
 src/prepare_split.py    curates build_dataset.py's output: drops misaligned
                         pairs, upsamples low-WER rows, balances assembled vs
-                        chunked rows
+                        chunked rows, upsamples confirmed-named-entity rows
+src/build_entity_eval_slice.py, src/build_typo_eval_slice.py
+                        build the small held-out eval slices (named-entity,
+                        typo/dictation-form) from callcc-test-1k -- see
+                        "Named-entity eval slice"/"Typo/dictation-form eval
+                        slice" below
 src/data.py             dataset loading + tokenization/label-masking
 src/config.py           YAML config -> Config dataclass, with typo checking
 src/evaluate.py         runs the model on a test set, scores WER, saves
@@ -91,6 +96,10 @@ docs/asr_dataset_builder.md
 notebooks/load_model.ipynb
                         download one experiment's folder from the Hub and
                         run it on a sample transcript
+notebooks/explore_finetuning_data.ipynb
+                        browse build_dataset.py/prepare_split.py output by
+                        hand -- composition, entity/typo detection, word
+                        confidence, length distributions, sample/search tools
 ```
 
 ## 1. Build the training data
@@ -154,11 +163,24 @@ python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_c
   of rows -- directly investigating fine-tuned predictions found reliable
   fixes for dictation-form errors (stutters, word-boundary merges, ZWNJ) but
   zero confirmed successes on an actually mis-heard name in a small sample.
-  Detection reuses `build_dataset.py`'s `crm_context` (only ever present on
-  assembled rows) the same way `build_entity_eval_slice.py` does for the eval
-  slice below: a row counts as "entity" only if the CRM customer name or
-  case-owner name has a word that actually appears in the target text -- a
-  confirmed real entity, not a rare-word heuristic guess. `0` disables it.
+  Detection combines two signals, either one qualifying a row (both only
+  ever present on assembled rows): `build_dataset.py`'s `crm_context` (a row
+  counts as "entity" if the CRM customer name or case-owner name has a word
+  that actually appears in the target text -- a confirmed real entity, same
+  as `build_entity_eval_slice.py`'s eval-slice detection), and its
+  `word_confidence` (Soniox's own per-word confidence, from the `tokens/`
+  shards) -- a word below `--entity-confidence-max` (default `0.3`) that's
+  also long/rare enough (`--entity-confidence-max-freq`, default `1`) to
+  plausibly be a name. The second signal matters because CRM data only
+  covers ~25% of calls; confidence exists on every call. Getting a workable
+  threshold took real tuning, not a guess: `build_dataset.py`'s storage
+  cutoff (0.8) alone, even combined with length/rarity gates, still flagged
+  50-70% of assembled rows as "entity" at real-data (3,000-call) scale --
+  0.3 landed at ~16%. Worth knowing: at that low a threshold, a sample was a
+  real mix of genuine hard-to-transcribe words and cases where Soniox
+  itself, not just Whisper, may be unreliable -- different from the 0.5-0.8
+  range, verified separately to still usually be correct even when unsure.
+  `0` disables the whole step (both signals).
   `--entity-max-repeats` (default `5`) caps how many times any single row
   can be duplicated to get there -- verified directly: distinct customer
   names scale roughly linearly with how many raw calls you process (~324
@@ -175,6 +197,12 @@ python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_c
 
 Point `dataset_id` in your config at this curated file, not the raw one from
 step 1.
+
+To manually inspect either file -- composition, entity/typo detection, word
+confidence, length distributions, or just browsing/searching real rows --
+open `notebooks/explore_finetuning_data.ipynb` and point it at your own
+`build_dataset.py`/`prepare_split.py` output (defaults to the sample paths
+used to build it).
 
 ## 2. Configure a run
 
@@ -419,6 +447,70 @@ every other `test.*` generation setting: results land under
 and log to TensorBoard as `test_entity_wer`/`test_entity_wer_zwnj_normalized`/
 `test_entity_exact_match`/`test_entity_hallucination_rate`, tracked
 separately from the main `test_*` curves throughout training.
+
+### Typo/dictation-form eval slice
+
+Complements the entity slice with the *other* main error category --
+stutters, word-boundary merges, ZWNJ half-spacing, letter-level slips --
+which direct investigation found the model already handles well. This is a
+**regression guard**, not an improvement target: as training leans harder on
+entity correction (`prepare_split.py`'s entity upsampling), this is what
+would catch it if that quietly erodes the dictation-error correction that
+already works.
+
+```bash
+python src/build_typo_eval_slice.py --output data/typo_eval_slice.jsonl
+```
+
+Same word-alignment method as the entity slice, opposite signal: for each
+reference word Whisper got wrong, high character overlap with Whisper's
+word (ZWNJ-normalized) means a spacing/stutter/boundary slip, low overlap
+means a different word entirely (an entity slice concern, not this one). A
+row qualifies only if it has a typo-like error and *no* entity-like error,
+so the two slices stay disjoint. Point `test.typo_dataset_id` at the output
+-- same wiring as the entity slice (`test_eval_typo/`,
+`test_typo_wer`/`test_typo_wer_zwnj_normalized`/`test_typo_exact_match`/
+`test_typo_hallucination_rate`), and both run through the same
+`run_secondary_eval()` helper in `evaluate.py`, so adding another named
+slice beyond these two doesn't mean copy-pasting a third near-identical
+eval block into `train.py`/`TestEvalCallback`.
+
+### Punctuation
+
+By default this task is punctuation-free end to end: `text_whisper` (this
+model's actual input) never has punctuation, `text` (the default
+`target_column`) has had it stripped, and the system prompt says so
+explicitly ("Do not add punctuation"). But every dataset this pipeline
+touches also carries a *punctuated* version of the same reference --
+`text_soniox` in our own curated data, `text_raw` on
+`ErfanRou/callcc-test-1k` and the entity/typo eval slices -- currently
+unused. `include_punctuation: true` swaps in a punctuation-aware system
+prompt (`data.py`'s `SYSTEM_PROMPT_WITH_PUNCTUATION`) so you can test
+training/evaluating against it instead.
+
+It's deliberately *not* a single do-everything flag: it only swaps the
+system prompt. You still set `target_column`/`test_target_column`
+explicitly, since the punctuated column has a different name per dataset
+and guessing wrong would silently train on the wrong target with no error.
+`train.py` warns at startup (doesn't block) if the flag and the column
+names it recognizes look inconsistent with each other:
+
+```bash
+python src/train.py --config configs/qwen3.5-2b.yaml \
+  --set include_punctuation=true \
+  --set target_column=text_soniox \
+  --set test.target_column=text_raw \
+  --set output_dir=./outputs/qwen3.5-2b-punctuated
+```
+
+Worth knowing before you compare results: this is a strictly harder version
+of the task, not just an added nicety. Whisper's output carries no acoustic
+pause/prosody cues, so the model has to infer sentence structure from
+content alone. `wer`/`wer_zwnj_normalized` also aren't directly comparable
+across punctuated vs. punctuation-free runs -- a word-level WER treats
+`"سلام،"` and `"سلام"` as different tokens, so every sentence-boundary guess
+the model gets even slightly wrong counts as a full word error on top of
+whatever content/entity errors it also made.
 
 ### Best checkpoint by WER
 

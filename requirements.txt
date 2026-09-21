@@ -17,3 +17,8 @@ jiwer
 # best-effort (won't abort the script if the build fails); not required.
 # causal-conv1d
 # flash-linear-attention
+# only needed to open/run notebooks/explore_finetuning_data.ipynb
+# pandas
+# matplotlib
+# ipykernel
+# nbconvert

@@ -70,7 +70,7 @@ def main():
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    cols = ["call_id", "channel", "text_whisper", "text", "crm_metadata"]
+    cols = ["call_id", "channel", "text_whisper", "text", "text_raw", "crm_metadata"]
     tables = []
     for path in paths:
         with fs.open(path, "rb") as f:
@@ -95,6 +95,8 @@ def main():
             "channel": r["channel"],
             "text_whisper": r["text_whisper"],
             "text": r["text"],
+            # Punctuated version of `text` -- see Config.include_punctuation.
+            "text_raw": r["text_raw"],
             "entity_words": hit_words,
             "entity_word_missing_from_whisper": any(w not in whisper_words for w in hit_words),
         })
