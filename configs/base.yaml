@@ -44,6 +44,13 @@ mask_low_signal_corrections: false
 mask_min_similarity: 0.75
 mask_max_common_freq: 1
 
+# Loads the base model + sets up LoRA via Unsloth's FastLanguageModel instead
+# of plain transformers + peft -- reported ~2x faster training and ~70% less
+# VRAM on Qwen3/Gemma3 (see README's "Unsloth" section). Requires a CUDA GPU
+# and the `unsloth` package; not verified end-to-end in this repo (written
+# without CUDA available) -- test on a real GPU before relying on it.
+use_unsloth: false
+
 training:
   # 2, not 3: research on LoRA SFT (Raschka's empirical study) found extra
   # epochs actively hurt via overfitting, and prepare_split.py's agree-bucket

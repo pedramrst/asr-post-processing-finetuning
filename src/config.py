@@ -135,6 +135,18 @@ class Config:
     lora_dropout: float = 0.05
 
     load_in_4bit: bool = False
+    # Loads the base model + sets up LoRA via Unsloth's FastLanguageModel
+    # instead of plain transformers.AutoModelForCausalLM + peft.get_peft_model
+    # -- Unsloth patches the model with fused kernels and its own
+    # gradient-checkpointing implementation for reported ~2x faster training
+    # and ~70% less VRAM on Qwen3/Gemma3, without changing anything else
+    # about this script (still a plain transformers.Trainer underneath, not
+    # TRL's SFTTrainer -- Unsloth's optimization is applied at model-loading
+    # time, so it works with any trainer). Requires a CUDA GPU and the
+    # `unsloth` package -- NOT verified end-to-end in this repo (no CUDA
+    # available in the dev environment this was written in); test on a real
+    # GPU before relying on it for a full run.
+    use_unsloth: bool = False
 
     # All runs pushing to the same hub_repo_id share ONE Hub repo, each in its
     # own folder -- hub_repo_folder null defaults to output_dir's basename.

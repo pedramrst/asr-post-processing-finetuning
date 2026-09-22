@@ -11,6 +11,10 @@ python-dotenv
 jiwer
 # only needed if training with --load_in_4bit (QLoRA) on a CUDA GPU
 # bitsandbytes
+# only needed if training with use_unsloth: true (see README's "Unsloth"
+# section) -- requires a CUDA GPU, not installable/testable in this repo's
+# dev environment
+# unsloth
 # optional: speeds up Qwen3.5's hybrid SSM/linear-attention layers (falls
 # back to a correct but much slower reference PyTorch path without them).
 # CUDA/torch-version-sensitive compiled extensions -- run.sh installs these

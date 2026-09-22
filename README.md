@@ -248,6 +248,8 @@ raises an error immediately rather than being silently ignored:
 - `mask_low_signal_corrections` / `mask_min_similarity` /
   `mask_max_common_freq`: opt-in feature flag to mask un-guessable
   corrections out of the loss -- see "Low-signal correction masking" below.
+- `use_unsloth`: opt-in feature flag to load the model/set up LoRA via
+  Unsloth instead of plain transformers + peft -- see "Unsloth" below.
 - `training.*`: epochs, batch size, learning rate, save/eval cadence, etc.
 - `lora.*`: LoRA rank/alpha/dropout.
 - `quantization.load_in_4bit`: QLoRA; needs `bitsandbytes` + a CUDA GPU.
@@ -408,6 +410,21 @@ now calls `torch.cuda.empty_cache()` right after generation to release that
 back before training resumes, and `run.sh` sets
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` as further mitigation. If
 OOM recurs anyway, `test.batch_size` is the first thing to dial back down.
+
+Generation batches are formed by length (longest first), not dataset order --
+`model.generate()` only finishes a batch once every sequence in it has
+stopped, so one long input landing next to several short ones used to force
+the whole batch to keep decoding (and padding) far past where the short ones
+would've finished alone. Given this task's huge length spread (chunked rows
+~15-40 words vs. assembled rows up to ~3,000), an unlucky batch composition
+could single-handedly dominate an eval pass's wall-clock. `generate_batch()`
+sorts prompts by length before batching and restores the original order
+before returning, at no cost beyond the sort itself (verified with a unit
+test that output-to-input correspondence survives the reordering correctly).
+Training batches get the same treatment via `train_sampling_strategy:
+"group_by_length"` in `TrainingArguments` (the successor to the old
+`group_by_length: true` boolean flag, renamed in the transformers version
+this repo pins -- verified directly, the old kwarg raises `TypeError` here).
 
 If a model's `transformers` warns about `causal_conv1d`/
 `chunk_gated_delta_rule` falling back to a reference PyTorch implementation
@@ -613,6 +630,45 @@ disk each time rather than kept in memory, so it stays correct across a
 resumed run too. It only exists when `test.dataset_id` is set, and it's a
 full independent copy -- pruning older numbered checkpoints via
 `save_total_limit` never affects it.
+
+### Unsloth
+
+`use_unsloth: true` swaps model loading and LoRA setup over to
+[Unsloth](https://unsloth.ai)'s `FastLanguageModel`, in place of plain
+`transformers.AutoModelForCausalLM` + `peft.get_peft_model`. Unsloth patches
+the model with fused kernels and its own gradient-checkpointing
+implementation, and reports (their own benchmarks, not independently
+re-verified here) roughly 2x faster training and ~70% less VRAM on the
+Qwen3/Gemma3 model families this repo uses. Its optimization is applied at
+the model-loading step, not the training loop, so it's compatible with the
+plain `transformers.Trainer` this script already uses (not TRL's
+`SFTTrainer`, which every one of Unsloth's own quickstart examples happens
+to use, but isn't required) -- everything else (the custom `PadCollator`,
+`TestEvalCallback`, hub sync, baseline eval, masking) is unaffected.
+
+```bash
+python src/train.py --config configs/qwen3.5-2b.yaml --set use_unsloth=true
+```
+
+Requires a CUDA GPU and the `unsloth` package (see `requirements.txt`).
+**Not verified end-to-end in this repo** -- there is no CUDA GPU in the
+environment this integration was written and reviewed in, so unlike
+everything else in this pipeline, this specific path could only be checked
+against Unsloth's own documented API, not actually run. Test it on a real
+GPU (a short run, not a full fine-tune) before trusting it. A few interacting
+settings to be aware of, verified by reading rather than executing:
+- `load_in_4bit` is passed straight to `FastLanguageModel.from_pretrained`
+  instead of building a separate `BitsAndBytesConfig` -- don't expect both
+  paths to be active at once.
+- `gradient_checkpointing` in `TrainingArguments` is automatically forced off
+  when `use_unsloth` is on (`get_peft_model(..., use_gradient_checkpointing=
+  "unsloth")` already handles it) -- leaving both on would double up two
+  different checkpointing implementations rather than complementing each
+  other.
+- `target_modules` uses the explicit 7-name projection list from Unsloth's
+  own docs (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/
+  `down_proj`), not this repo's usual `"all-linear"` shorthand, since
+  Unsloth's `get_peft_model` doesn't accept that shorthand.
 
 ## 4. Compare multiple models/configs
 

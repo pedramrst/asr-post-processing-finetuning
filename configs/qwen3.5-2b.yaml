@@ -2,14 +2,12 @@
 # base.yaml default, so it gets its own file instead of a couple of
 # overrides on top of base.yaml.
 #
-# Batch size sized for a 32GB RTX 5090: per-device 4 (up from 2) with
-# gradient_accumulation 4 keeps the same effective batch size (16) as before
-# while using more of the card's memory per step for better throughput --
-# an estimate, not a measurement (nothing here has run on real hardware
-# yet). If you hit OOM on first run, drop per_device_train/eval_batch_size
-# back to 2 and double gradient_accumulation_steps to compensate; if GPU
-# utilization looks low (check `nvidia-smi` during a step), there's likely
-# room to push batch size higher still.
+# Batch size: per-device 2 with gradient_accumulation 8 (effective batch
+# size 16). Measured, not estimated -- per-device 4 was tried first (a
+# hoped-for throughput improvement) and OOM'd on a 32GB RTX 5090, so this was
+# reverted back to 2. Revisit raising it again only after separately testing
+# use_unsloth and/or quantization.load_in_4bit, both of which free up real
+# VRAM and haven't been tried yet.
 
 
 model_id: Qwen/Qwen3.5-2B
@@ -17,7 +15,7 @@ dataset_id: ./asr_dataset_curated.jsonl
 train_split: train
 eval_split: null
 eval_fraction: 0.1
-train_fraction: 0.2   # data-scaling ablation: train on 20% of the curated set, not all of it
+train_fraction: null   # null -> use every row; set e.g. 0.2 for a data-scaling ablation
 input_column: text_whisper
 target_column: text
 system_prompt: null
@@ -30,9 +28,9 @@ training:
   # 2, not 3 -- see base.yaml's comment: extra epochs risk overfitting,
   # compounded by prepare_split.py's row upsampling.
   num_train_epochs: 2.0
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 4
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
   learning_rate: 1.0e-4
   warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
   logging_steps: 10

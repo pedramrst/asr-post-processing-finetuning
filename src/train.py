@@ -151,40 +151,74 @@ def main() -> None:
     tb_dir = cfg.tensorboard_logging_dir or str(output_dir / "tb")
     os.environ["TENSORBOARD_LOGGING_DIR"] = tb_dir
 
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
+    if cfg.use_unsloth:
+        # Unsloth's from_pretrained/get_peft_model replace both the plain
+        # tokenizer/model loading and the LoraConfig/get_peft_model setup
+        # below -- everything after this branch (Trainer, callbacks, eval)
+        # is unchanged, since Unsloth's optimization is applied at the
+        # model-loading step, not the training loop. `target_modules` is the
+        # explicit projection-layer list from Unsloth's own docs (their
+        # get_peft_model doesn't take peft's "all-linear" shorthand); this
+        # is the standard LLaMA-family module set both Qwen and Gemma follow.
+        from unsloth import FastLanguageModel
 
-    quantization_config = None
-    if cfg.load_in_4bit:
-        from transformers import BitsAndBytesConfig
-
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=cfg.model_id,
+            max_seq_length=cfg.max_length,
+            load_in_4bit=cfg.load_in_4bit,
+            full_finetuning=False,
         )
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
+        model.config.pad_token_id = tokenizer.pad_token_id
 
-    model = AutoModelForCausalLM.from_pretrained(
-        cfg.model_id,
-        dtype=torch.bfloat16,
-        device_map="auto",
-        quantization_config=quantization_config,
-    )
-    model.config.pad_token_id = tokenizer.pad_token_id
-    model.enable_input_require_grads()
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=cfg.lora_r,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+            random_state=cfg.seed,
+            max_seq_length=cfg.max_length,
+        )
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "right"
 
-    lora_config = LoraConfig(
-        r=cfg.lora_r,
-        lora_alpha=cfg.lora_alpha,
-        lora_dropout=cfg.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules="all-linear",
-    )
-    model = get_peft_model(model, lora_config)
+        quantization_config = None
+        if cfg.load_in_4bit:
+            from transformers import BitsAndBytesConfig
+
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+        model = AutoModelForCausalLM.from_pretrained(
+            cfg.model_id,
+            dtype=torch.bfloat16,
+            device_map="auto",
+            quantization_config=quantization_config,
+        )
+        model.config.pad_token_id = tokenizer.pad_token_id
+        model.enable_input_require_grads()
+
+        lora_config = LoraConfig(
+            r=cfg.lora_r,
+            lora_alpha=cfg.lora_alpha,
+            lora_dropout=cfg.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules="all-linear",
+        )
+        model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
     raw = load_sft_dataset(
@@ -269,7 +303,22 @@ def main() -> None:
         save_steps=cfg.save_steps,
         save_total_limit=cfg.save_total_limit,
         bf16=True,
-        gradient_checkpointing=True,
+        # When use_unsloth is on, get_peft_model() above was already called
+        # with use_gradient_checkpointing="unsloth" -- Trainer's own generic
+        # gradient_checkpointing_enable() is a different implementation, so
+        # leaving this True too would double up (or conflict with) Unsloth's
+        # own checkpointing rather than complementing it.
+        gradient_checkpointing=not cfg.use_unsloth,
+        # Batches sequences of similar length together (still shuffled at the
+        # mega-batch level, not a fixed dataset order) instead of forming
+        # batches in dataset order -- this dataset's length spread is large
+        # (chunked rows ~15-40 words vs. assembled rows up to ~3,000), so an
+        # unsorted batch can pad every short sequence up to whatever long one
+        # happens to land next to it, wasting real compute/memory on pad
+        # tokens. `group_by_length` (the old boolean flag) was renamed to
+        # this string field in the installed transformers version -- verified
+        # directly, the old kwarg name raises TypeError here.
+        train_sampling_strategy="group_by_length",
         report_to=["tensorboard"],
         disable_tqdm=False,
         seed=cfg.seed,

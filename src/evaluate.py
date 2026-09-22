@@ -108,14 +108,27 @@ def generate_batch(
     into a runaway repeat loop, tanking WER/hallucination_rate on otherwise
     good predictions. `repetition_penalty`/`no_repeat_ngram_size` are the
     standard mitigation.
+
+    Batches are formed by length (longest first), not input order:
+    `model.generate()` only stops a whole batch once every sequence in it
+    has finished, so a single long prompt landing next to several short ones
+    forces the short ones to keep decoding (and padding) far past where they
+    would've stopped alone. This dataset's length spread is large (chunked
+    rows ~15-40 words vs. assembled rows up to ~3,000), so an unsorted batch
+    can be much slower than it needs to be. Sorting first (then restoring
+    original order before returning) removes that waste for free; longest
+    first also surfaces an OOM immediately rather than partway through.
     """
-    outputs = []
+    order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]), reverse=True)
+    sorted_prompts = [prompts[i] for i in order]
+
+    outputs_sorted = []
     prior_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"  # so every sequence in a batch ends at the same index
     try:
-        batch_starts = range(0, len(prompts), batch_size)
+        batch_starts = range(0, len(sorted_prompts), batch_size)
         for i in tqdm(batch_starts, desc="generating", unit="batch"):
-            batch = prompts[i : i + batch_size]
+            batch = sorted_prompts[i : i + batch_size]
             enc = tokenizer(batch, return_tensors="pt", padding=True, add_special_tokens=False)
             enc = {k: v.to(model.device) for k, v in enc.items()}
             generated = model.generate(
@@ -127,9 +140,13 @@ def generate_batch(
                 no_repeat_ngram_size=no_repeat_ngram_size,
             )
             new_tokens = generated[:, enc["input_ids"].shape[1] :]
-            outputs.extend(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))
+            outputs_sorted.extend(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))
     finally:
         tokenizer.padding_side = prior_padding_side
+
+    outputs = [None] * len(prompts)
+    for sorted_pos, original_idx in enumerate(order):
+        outputs[original_idx] = outputs_sorted[sorted_pos]
     return outputs
 
 
