@@ -25,11 +25,11 @@
 #                     the full dataset was already built (run `build` first).
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
 #                     run `smoke` first if you haven't already.
-#   ./run.sh agent    Start the Telegram + Claude tool-calling operations
-#                     agent (see README's "Telegram agent" section). Runs
+#   ./run.sh agent    Start the Telegram + LLM tool-calling operations agent
+#                     (see README's "Telegram agent" section). Runs
 #                     indefinitely, long-polling Telegram -- needs
-#                     ANTHROPIC_API_KEY/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID in
-#                     .env.
+#                     OPENROUTER_API_KEY/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
+#                     (and HF_TOKEN, checked below for every mode) in .env.
 #
 # Runs inside tmux automatically (session name "run") so a dropped SSH
 # connection doesn't kill a long build/sweep -- reattach with `tmux attach -t run`.
