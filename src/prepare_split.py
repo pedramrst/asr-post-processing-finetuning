@@ -101,21 +101,27 @@ def parse_args():
     p.add_argument("--entity-min-name-word-len", type=int, default=3,
                     help="Minimum character length for a CRM or low-confidence name-candidate word to "
                          "count as a match.")
-    p.add_argument("--entity-confidence-max", type=float, default=0.3,
+    p.add_argument("--entity-confidence-max", type=float, default=0.45,
                     help="A word's Soniox confidence (build_dataset.py's word_confidence) has to be below "
                          "this -- well under build_dataset.py's own storage cutoff (default 0.8) -- to "
-                         "count as a confidence-based entity candidate. Tuned against real data: 0.5 still "
-                         "flagged ~44%% of assembled rows as 'entity'; 0.3 (combined with "
-                         "--entity-confidence-max-freq) landed at ~16%%. Going this low trades away some "
-                         "precision differently than higher confidence ranges do -- a sample at this "
-                         "threshold was a real mix of genuine hard-to-transcribe words and cases where "
-                         "Soniox itself, not just Whisper, may be unreliable (unlike the 0.5-0.8 range, "
-                         "verified to still usually be correct even when unsure).")
-    p.add_argument("--entity-confidence-max-freq", type=int, default=1,
+                         "count as a confidence-based entity candidate. The original default (0.3) was too "
+                         "strict for real domain vocabulary that isn't name-rare but is still moderately "
+                         "uncommon and Whisper-hard (e.g. product/scent terms average confidence around "
+                         "0.44 in one verified case), so it never got the upsampling boost. Loosened here, "
+                         "combined with --entity-confidence-max-freq.")
+    p.add_argument("--entity-confidence-max-freq", type=int, default=3,
                     help="A confidence-based entity candidate also has to occur at most this many times "
                          "across the whole pool being curated -- confidence and length alone still aren't "
                          "a strong enough filter, since Persian's morphology means plenty of non-entity "
-                         "word forms are also locally rare.")
+                         "word forms are also locally rare. WARNING: verified directly, this has a sharp "
+                         "cliff around 4-5 on real data, not a gradual slope -- assembled rows are full-call "
+                         "length (often 100+ words), so once the frequency cap is loose enough, the odds "
+                         "that a long row contains *some* matching word by chance approach certainty, and "
+                         "the flagged share jumps from ~10-15%% to 40-60%%+ almost discontinuously. Re-check "
+                         "the printed flagged-% against your actual corpus before raising this past ~3, and "
+                         "don't assume thresholds tuned on one corpus/sample transfer to another -- flagged "
+                         "rates verified here differed drastically from a smaller local sample vs. the "
+                         "full-scale corpus these defaults were tuned against.")
     p.add_argument("--entity-max-repeats", type=int, default=5,
                     help="Cap on how many times any single confirmed-entity row can be duplicated when "
                          "upsampling -- without this, a small distinct-entity pool relative to "

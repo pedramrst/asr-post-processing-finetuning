@@ -169,18 +169,30 @@ python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_c
   that actually appears in the target text -- a confirmed real entity, same
   as `build_entity_eval_slice.py`'s eval-slice detection), and its
   `word_confidence` (Soniox's own per-word confidence, from the `tokens/`
-  shards) -- a word below `--entity-confidence-max` (default `0.3`) that's
-  also long/rare enough (`--entity-confidence-max-freq`, default `1`) to
-  plausibly be a name. The second signal matters because CRM data only
-  covers ~25% of calls; confidence exists on every call. Getting a workable
-  threshold took real tuning, not a guess: `build_dataset.py`'s storage
-  cutoff (0.8) alone, even combined with length/rarity gates, still flagged
-  50-70% of assembled rows as "entity" at real-data (3,000-call) scale --
-  0.3 landed at ~16%. Worth knowing: at that low a threshold, a sample was a
-  real mix of genuine hard-to-transcribe words and cases where Soniox
-  itself, not just Whisper, may be unreliable -- different from the 0.5-0.8
-  range, verified separately to still usually be correct even when unsure.
-  `0` disables the whole step (both signals).
+  shards) -- a word below `--entity-confidence-max` (default `0.45`) that's
+  also long/rare enough (`--entity-confidence-max-freq`, default `3`) to
+  plausibly be a name or hard domain term. The second signal matters
+  because CRM data only covers ~25% of calls; confidence exists on every
+  call. Getting a workable threshold took real tuning, not a guess:
+  `build_dataset.py`'s storage cutoff (0.8) alone, even combined with
+  length/rarity gates, still flagged 50-70% of assembled rows as "entity"
+  at real-data (3,000-call) scale -- the original defaults (0.3/1) landed
+  at ~16% there. Those defaults turned out too strict for real but
+  moderately-rare domain vocabulary, though (verified directly: a
+  fine-tuned model failed to correct a recurring product/scent term whose
+  measured Soniox confidence, ~0.44, sat just above the 0.3 cutoff, so
+  those rows never got the upsampling boost) -- hence the looser defaults.
+  **Re-tune both against your own corpus before relying on them**: verified
+  directly, `--entity-confidence-max-freq` has a sharp cliff around 4-5, not
+  a gradual slope -- assembled rows are full-call length (often 100+
+  words), so once the cap is loose enough, the odds that a long row
+  contains *some* matching word by chance approach certainty, and the
+  flagged share jumps from ~10-15% to 40-60%+ almost discontinuously.
+  Flagged rates also differed drastically between a smaller local sample
+  and the full-scale corpus these were originally tuned against -- don't
+  assume a threshold transfers between corpora of very different size
+  without checking the printed flagged-% first. `0` disables the whole
+  step (both signals).
   `--entity-max-repeats` (default `5`) caps how many times any single row
   can be duplicated to get there -- verified directly: distinct customer
   names scale roughly linearly with how many raw calls you process (~324
