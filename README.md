@@ -83,6 +83,15 @@ src/hub_sync.py         uploads a run's output_dir into its folder in the
 src/train.py            single training run (LoRA SFT)
 src/run_sweep.py        runs several training configs back-to-back, then
                         compares them (by test WER, falling back to eval loss)
+                        -- auto-continues the winner with a follow-up run
+src/supervise.py        launches/monitors one training run as a detached
+                        process, with CUDA-OOM auto-recovery -- see
+                        "Telegram agent" below
+src/tools.py            the ~20 named operations the Telegram agent can
+                        call (process control, config, data/checkpoints,
+                        results, sweeps, GPU/disk health)
+src/notify.py           Telegram send/receive helpers
+src/telegram_agent.py   the agent's long-polling loop (`./run.sh agent`)
 configs/base.yaml       template/example single-run config (not currently
                         used by sweep.yaml -- see below)
 configs/qwen3.5-2b.yaml, configs/gemma-3-1b-it.yaml
@@ -715,6 +724,119 @@ model + LoRA adapter, and runs it on a sample transcript -- also shows that
 run's `test_eval` results if it has any. Point `RUN_FOLDER` at a specific
 checkpoint subfolder instead of the run root to load an earlier checkpoint
 rather than the final saved adapter.
+
+## 6. Telegram agent
+
+`./run.sh agent` starts a long-running process that lets you control this
+pipeline from Telegram in plain, technical language -- e.g. "what's the WER
+trend on the qwen run", "drop batch size to 1 and restart", "show me the
+highest-WER predictions from the latest checkpoint". It's built on LLM
+tool-calling, not a keyword classifier -- several requests need free-form
+argument extraction from casual phrasing (which config, which field, what
+value; which checkpoint; what filter), which is a generation problem, not a
+fixed-label one; tool-calling handles intent selection and argument
+extraction in one call.
+
+Needs `OPENROUTER_API_KEY` in `.env`, routed through OpenRouter's universal
+OpenAI-compatible chat completions endpoint (`src/telegram_agent.py`'s
+`_make_client()`) -- deliberately *not* Anthropic's own tool_runner/
+OpenRouter's Anthropic-specific endpoint, which only works for Anthropic
+models: using the OpenAI-format tool-calling loop instead means `AGENT_MODEL`
+(default `anthropic/claude-opus-5`) can be set to any tool-calling-capable
+model OpenRouter carries -- e.g. `openai/gpt-5`, `google/gemini-3-pro` -- see
+https://openrouter.ai/models. This required no changes to `tools.py`'s tool
+definitions: OpenAI's `parameters` field and Anthropic's `input_schema` are
+both plain JSON Schema, so `telegram_agent.py` just reshapes the
+`@beta_tool`-generated schemas rather than redefining them, and calls the
+underlying function directly via each tool's `.func`.
+extraction in one call.
+
+Deliberately **not** an open "run arbitrary shell/Python" tool. Every
+capability the agent has is one of a fixed, named set of Python functions in
+`src/tools.py` -- what it can do is bounded and auditable, not "whatever it
+decides to type":
+
+| Group | Tools |
+|---|---|
+| Process control | `check_training_status`, `stop_training`, `run_finetune`, `resume_training` |
+| Config | `edit_config`, `get_effective_config`, `validate_config` |
+| Data & checkpoints | `build_data`, `list_checkpoints`, `check_hf_upload`, `sync_to_hub` |
+| Results & metrics | `get_checkpoint_metrics`, `get_secondary_eval_metrics`, `sample_predictions`, `query_predictions`, `compare_runs` |
+| Sweeps | `run_sweep` |
+| Operational health | `check_gpu`, `check_disk_usage`, `tail_log` |
+
+`query_predictions`'s `filter` argument is a small fixed-vocabulary DSL
+(`{"field": ..., "op": ..., "value": ...}`, restricted to known prediction
+fields and comparison operators) -- not an arbitrary expression or code
+string. This is the one place a careless design could reintroduce
+uncontrolled code execution; keeping it a constrained mini-DSL
+(`tools.apply_prediction_filter`, unit-tested) is deliberate.
+
+### Confirmation
+
+State-changing tools (`stop_training`, `run_finetune`, `resume_training`,
+`edit_config`, `build_data`, `sync_to_hub`, `run_sweep`) take a `confirmed`
+parameter. There's no separate pending-action state machine: the gate lives
+*inside the tool function itself* -- called with `confirmed=False` (the
+default), it describes what it would do without doing it, and the model's
+reply naturally asks you to confirm. Your next message is just the next
+turn in the same conversation, and the model decides from context whether
+it's a confirmation, a cancellation, or something unrelated -- the same way any
+other multi-turn tool use works, not a hand-written yes/no keyword parser.
+
+### The training supervisor (`src/supervise.py`)
+
+Backs `run_finetune`/`resume_training`/`stop_training`. Launches `train.py`
+as a **detached** background process (so the agent stays responsive to new
+messages while training runs for hours) and monitors it for a CUDA-OOM
+crash specifically -- nothing broader. On a match, it halves
+`per_device_train_batch_size` (floor 1) and doubles
+`gradient_accumulation_steps` to preserve the effective batch size, halves
+`test.batch_size` too (the one OOM already seen in this project happened
+during checkpoint-eval generation, not a training step), sets
+`resume_from_checkpoint`, and retries -- capped, and never by editing the
+checked-in YAML (every adjustment is an in-memory `--set`-style override the
+supervisor tracks itself). Any other failure -- including a silent
+host-level (CPU RAM) OOM, which the Linux kernel SIGKILLs with no traceback
+at all -- stops and sends a Telegram alert instead of guessing at a fix. A
+deliberate stop (SIGINT/SIGTERM to the supervisor) is distinguished from a
+crash, so Ctrl-C in the tmux pane doesn't trigger a false crash alert.
+
+State (pid, config, output_dir, retry count) is persisted to
+`.agent_training_state.json` so a restarted agent (or a `check_training_status`
+call from a fresh process) can always answer "is something running" without
+holding an in-memory handle across process boundaries. A running supervisor
+also periodically checks `test_eval/metrics.json` and sends a checkpoint
+digest (WER, exact_match, hallucination_rate, and a trend classification --
+improving/plateaued/regressed -- computed from its own
+`supervisor_wer_history.jsonl`, since `best_checkpoint_wer/best_metrics.json`
+only ever updates on improvement and so can't show a plateau or a
+regression on its own).
+
+### Sweeps auto-continue their winner
+
+After `run_sweep.py` ranks jobs by test WER (unchanged from before), it now
+also automatically launches a longer follow-up run from the winning job's
+own resolved config (`<output_root>/<name>/config.yaml`, not the raw
+`sweep.yaml` job entry, which lacks that job's specific overrides), resumed
+from that job's `best_checkpoint_wer/` into a **new** output directory
+(`<name>-followup`, so the follow-up's artifacts don't overwrite the
+original sweep entry's results in place) -- routed through the same
+supervisor, so it gets the same crash recovery as any other run. Explicitly
+guards against an all-failed sweep (the ranking's `sorted(...)[0]` would
+otherwise still return a job even when every `test_wer` is `None`).
+
+### Caveats
+
+Not verified end-to-end against a real GPU/CUDA OOM or a live Telegram/
+OpenRouter API round-trip in the environment this was built in (no CUDA
+GPU, no OpenRouter/Telegram credentials there) -- the supervisor's orchestration logic
+(launch/detect/relaunch/cap-retries/SIGTERM-handling) was verified instead
+against a fake stand-in training script that can be told to raise a
+synthetic OOM, exit cleanly, or fail with an unrelated error, which exercises
+the same code paths without needing a GPU. Test this on the real instance
+(and confirm the actual OOM log signature matches a real traceback) before
+relying on it unattended.
 
 ## Notes
 

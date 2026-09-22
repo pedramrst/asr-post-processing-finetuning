@@ -23,6 +23,10 @@ from typing import Any
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from notify import send_telegram_message  # noqa: E402
+from supervise import launch_supervised_run  # noqa: E402
+
 
 def _deep_merge(base: dict, overrides: dict) -> dict:
     merged = dict(base)
@@ -93,6 +97,43 @@ def _test_wer(output_dir: Path) -> float | None:
     return json.loads(metrics_path.read_text()).get("wer")
 
 
+def _launch_followup(output_root: Path, winner: dict) -> None:
+    """Auto-continues the sweep's winner with a longer follow-up run,
+    resumed from its best checkpoint -- routed through
+    launch_supervised_run() so it gets the same CUDA-OOM auto-recovery as
+    any other supervised run.
+
+    Reads the winner's own resolved config from <output_root>/<name>/config.yaml
+    (written by train.py itself once training starts) rather than the raw
+    sweep.yaml job entry, which lacks that job's own `overrides` (e.g. a
+    different model_id). Uses a NEW output_dir (<name>-followup) rather than
+    reusing the winner's own directory, so the follow-up's artifacts don't
+    overwrite the sweep entry's original results in place.
+    """
+    name = winner["name"]
+    job_dir = output_root / name
+    resolved_config_path = job_dir / "config.yaml"
+    if not resolved_config_path.exists():
+        send_telegram_message(f"Sweep finished; winner '{name}' has no config.yaml to build a follow-up from -- skipping.")
+        return
+
+    best_checkpoint = job_dir / "best_checkpoint_wer"
+    if not best_checkpoint.exists():
+        send_telegram_message(f"Sweep finished; winner '{name}' has no best_checkpoint_wer/ to resume from -- skipping follow-up.")
+        return
+
+    followup_dir = output_root / f"{name}-followup"
+    overrides = {
+        "output_dir": str(followup_dir),
+        "resume_from_checkpoint": str(best_checkpoint.resolve()),
+    }
+    result = launch_supervised_run(str(resolved_config_path), overrides, label=f"{name}-followup")
+    send_telegram_message(
+        f"Sweep finished. Winner: '{name}' (test_wer={winner['test_wer']}). "
+        f"Launching follow-up run at {followup_dir} resumed from its best checkpoint. {result}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sweep", required=True, help="Path to a sweep YAML file (see configs/sweep.yaml).")
@@ -127,6 +168,16 @@ def main() -> None:
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(results, indent=2))
     print(f"\nSummary written to {summary_path}")
+
+    # Auto-continue the winner with a longer follow-up run. Guard against an
+    # all-failed sweep explicitly: sorted(...)[0] still returns a job even
+    # when every test_wer is None (the sort key just pushes None last, it
+    # doesn't exclude it), so this must check for a real winner first.
+    winner = sorted(results, key=lambda r: (r["test_wer"] is None, r["test_wer"], r["best_eval_loss"] is None, r["best_eval_loss"]))[0]
+    if winner["test_wer"] is None:
+        send_telegram_message("Sweep finished with no successful jobs (no test_wer recorded) -- skipping follow-up.")
+    else:
+        _launch_followup(output_root, winner)
 
 
 if __name__ == "__main__":

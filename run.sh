@@ -25,6 +25,11 @@
 #                     the full dataset was already built (run `build` first).
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
 #                     run `smoke` first if you haven't already.
+#   ./run.sh agent    Start the Telegram + Claude tool-calling operations
+#                     agent (see README's "Telegram agent" section). Runs
+#                     indefinitely, long-polling Telegram -- needs
+#                     ANTHROPIC_API_KEY/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID in
+#                     .env.
 #
 # Runs inside tmux automatically (session name "run") so a dropped SSH
 # connection doesn't kill a long build/sweep -- reattach with `tmux attach -t run`.
@@ -44,7 +49,7 @@ log() { printf '\n=== %s ===\n' "$1"; }
 
 # --- Validate the mode before doing any expensive setup work ---------------
 case "$MODE" in
-  smoke|build|sweep|full) ;;
+  smoke|build|sweep|full|agent) ;;
   train)
     if [ -z "$CONFIG_ARG" ]; then
       echo "Usage: ./run.sh train <config-name-or-path>" >&2
@@ -54,7 +59,7 @@ case "$MODE" in
     fi
     ;;
   *)
-    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full]" >&2
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full|agent]" >&2
     exit 1
     ;;
 esac
@@ -180,6 +185,23 @@ run_sweep() {
   python src/run_sweep.py --sweep configs/sweep.yaml
 }
 
+run_agent() {
+  if [ -z "${OPENROUTER_API_KEY:-}" ] && ! grep -q '^OPENROUTER_API_KEY=.' .env 2>/dev/null; then
+    echo "OPENROUTER_API_KEY not set (env or .env) -- the agent needs this to call Claude via OpenRouter. Aborting." >&2
+    exit 1
+  fi
+  if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] && ! grep -q '^TELEGRAM_BOT_TOKEN=.' .env 2>/dev/null; then
+    echo "TELEGRAM_BOT_TOKEN not set (env or .env). Aborting." >&2
+    exit 1
+  fi
+  if [ -z "${TELEGRAM_CHAT_ID:-}" ] && ! grep -q '^TELEGRAM_CHAT_ID=.' .env 2>/dev/null; then
+    echo "TELEGRAM_CHAT_ID not set (env or .env). Aborting." >&2
+    exit 1
+  fi
+  log "Starting Telegram agent (long-running -- reattach to this tmux session to check on it)"
+  python src/telegram_agent.py
+}
+
 run_train() {
   local cfg="$1" config_path
   shift
@@ -213,8 +235,9 @@ case "$MODE" in
   train) run_train "$CONFIG_ARG" "${@:3}" ;;
   sweep) run_sweep ;;
   full)  run_build; run_sweep ;;
+  agent) run_agent ;;
   *)
-    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full]" >&2
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full|agent]" >&2
     exit 1
     ;;
 esac

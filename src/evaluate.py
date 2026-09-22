@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import tempfile
 from collections import Counter
@@ -276,7 +277,16 @@ def run_test_eval(
         "hallucination_rate": hallucination_rate,
         "n_examples": len(ds),
     }
-    out_path.with_name("metrics.json").write_text(json.dumps(metrics, indent=2))
+    # Atomic write (temp file + os.replace), not a direct write_text(): a
+    # plain open("w") truncates the file before writing its content, so an
+    # external reader (e.g. the Telegram agent's tools.py polling this file)
+    # can race and read "" mid-write. Writing to a temp file in the same
+    # directory first and replacing it makes the read atomic for any reader.
+    metrics_path = out_path.with_name("metrics.json")
+    fd, tmp_name = tempfile.mkstemp(dir=metrics_path.parent, suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        f.write(json.dumps(metrics, indent=2))
+    os.replace(tmp_name, metrics_path)
     return metrics
 
 
