@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
+import jiwer
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import PreTrainedTokenizerBase
@@ -130,6 +132,200 @@ def load_sft_dataset(
     return result
 
 
+# Persian letter groups that are true homophones -- an artifact of spelling
+# preserving Arabic-loanword distinctions that collapsed to one sound in
+# Persian pronunciation (e.g. ز/ذ/ض/ظ are all just /z/). Mapping each group
+# to one canonical letter before comparing is what actually separates a
+# realistic ASR confusion (زفری -> ظفری, homophone substitution) from a word
+# that just happens to share some letters (الویزی -> پرویزی) -- tested
+# directly: plain character-set overlap and unnormalized edit distance both
+# scored the homophone case *lower* than at least one genuinely unrelated
+# pair, because Persian names often share a common suffix (e.g. "...ویزی")
+# that inflates either metric regardless of whether the actual word is
+# recoverable. ک/گ are deliberately excluded -- they're distinct phonemes in
+# Persian, not homophones, even though they look and sound similar-ish.
+_PHONETIC_GROUPS = ["زذضظ", "سصث", "تط", "قغ", "حه"]
+_PHONETIC_NORMALIZE = {ch: group[0] for group in _PHONETIC_GROUPS for ch in group}
+
+
+def _phonetic_similarity(a: str, b: str) -> float:
+    """1 - normalized character-level edit distance between `a` and `b`,
+    after ZWNJ-stripping and Persian-homophone normalization (see
+    _PHONETIC_GROUPS). 1.0 means identical once homophone spelling
+    differences are accounted for; 0.0 means completely different.
+    """
+    def normalize(s: str) -> str:
+        s = s.replace("‌", "")
+        return "".join(_PHONETIC_NORMALIZE.get(ch, ch) for ch in s)
+
+    a2, b2 = normalize(a), normalize(b)
+    if not a2 and not b2:
+        return 1.0
+    edits = jiwer.process_characters([a2], [b2])
+    total_edits = edits.substitutions + edits.deletions + edits.insertions
+    return 1 - total_edits / max(len(a2), len(b2))
+
+
+def low_signal_word_spans(
+    whisper_text: str,
+    target_text: str,
+    min_similarity: float = 0.75,
+    corpus_freq: Counter | None = None,
+    max_common_freq: int = 1,
+) -> list[tuple[int, int]]:
+    """Character [start, end) spans in `target_text` where correcting
+    whisper_text has no recoverable signal to learn from -- see
+    Config.mask_low_signal_corrections and README's "Low-signal correction
+    masking".
+
+    Verified directly on a sample of confirmed entity corrections: roughly
+    half had no recoverable signal at all -- the target word bears little
+    or no phonetic resemblance to what Whisper actually produced (e.g.
+    "الویزی" -> "پرویزی", or a word Whisper produced nothing for at all) --
+    while ones like "زفری" -> "ظفری" do (ز/ظ are true Persian homophones).
+    Training on the unrecoverable ones the same as everything else teaches
+    confident-sounding guessing, not real correction, so this flags them for
+    the caller to exclude from the training loss instead.
+
+    `min_similarity` is checked with _phonetic_similarity(), not plain
+    character overlap -- tested directly: unnormalized metrics (character-set
+    overlap, raw edit distance) scored the homophone case *lower* than a
+    genuinely unrelated pair, since Persian names often share a common
+    suffix that inflates similarity regardless of whether the word is
+    actually recoverable. The default 0.75 was picked to cleanly separate
+    known guessable pairs (>= 0.833: homophone substitutions, ZWNJ/spacing-
+    only differences) from known unguessable ones (<= 0.714) on that sample
+    -- like any threshold tuned on a small sample, treat it as a reasonable
+    starting point to revisit with more data, not a precise cutoff.
+
+    Only "substitute" (Whisper produced a different word) and "delete"
+    (jiwer's term for the reverse of what it sounds like here: the *target*
+    has a word Whisper produced *nothing* for at all, i.e. Whisper's output
+    is missing/"deleted" it) alignment chunks are considered -- "insert"
+    (Whisper hallucinated extra content not in the target) has no target-side
+    span to flag, and "equal" needs no correction at all. A "delete" chunk
+    has no Whisper span to compare against, so its similarity is always
+    0.0 -- the most unrecoverable case by construction, always excluded
+    regardless of `min_similarity` -- UNLESS the frequency gate below rules
+    it out first.
+
+    `corpus_freq` (a word -> corpus-wide occurrence count, e.g. from
+    train.py's Counter over every training-target text) adds a second,
+    necessary gate: verified directly against real training data, phonetic
+    similarity alone flagged mostly *common function/filler words*
+    ("رو", "بله", "و", "هم", "خب"), not names -- a "delete" chunk always
+    scores 0.0 similarity by construction, so a dropped "بله" (yes) was
+    masked exactly as often as a dropped name, even though "بله" is
+    trivially predictable from Persian dialogue structure regardless of
+    what Whisper produced, unlike an arbitrary proper noun. A span is only
+    masked if at least one of its words occurs at most `max_common_freq`
+    times in `corpus_freq` -- if every word in it is common, it's treated as
+    guessable from context and left in the loss. `corpus_freq=None` (the
+    default) skips this gate entirely, e.g. for testing this function in
+    isolation without a corpus.
+    """
+    target_words = target_text.split()
+    whisper_words = whisper_text.split()
+    if not target_words:
+        return []
+    alignment = jiwer.process_words([target_text], [whisper_text]).alignments[0]
+
+    # Character start offset of each target word, in order -- target_text is
+    # built from " ".join(...) upstream (build_dataset.py), so words are
+    # single-space-separated and this simple forward scan is exact.
+    word_starts = []
+    pos = 0
+    for w in target_words:
+        idx = target_text.index(w, pos)
+        word_starts.append(idx)
+        pos = idx + len(w)
+
+    spans = []
+    for chunk in alignment:
+        if chunk.type not in ("substitute", "delete"):
+            continue
+        ref_span_words = target_words[chunk.ref_start_idx : chunk.ref_end_idx]
+        hyp_span = " ".join(whisper_words[chunk.hyp_start_idx:chunk.hyp_end_idx])
+        ref_span = " ".join(ref_span_words)
+        if _phonetic_similarity(ref_span, hyp_span) >= min_similarity:
+            continue  # guessable enough from what Whisper actually said -- keep in the loss
+        if corpus_freq is not None and all(
+            corpus_freq.get(w, 0) > max_common_freq for w in ref_span_words
+        ):
+            continue  # every word here is common enough to be guessable from context alone
+        start = word_starts[chunk.ref_start_idx]
+        end = word_starts[chunk.ref_end_idx - 1] + len(target_words[chunk.ref_end_idx - 1])
+        spans.append((start, end))
+    return spans
+
+
+def _find_subsequence(haystack: list[int], needle: list[int]) -> int:
+    """Start index of the first contiguous occurrence of `needle` in
+    `haystack`, or -1 if it doesn't occur. Sizes here are small (one
+    example's token ids), so the naive scan is fine."""
+    if not needle:
+        return -1
+    first = needle[0]
+    limit = len(haystack) - len(needle)
+    for i in range(limit + 1):
+        if haystack[i] == first and haystack[i : i + len(needle)] == needle:
+            return i
+    return -1
+
+
+def _mask_low_signal_spans(
+    tokenizer: PreTrainedTokenizerBase,
+    target_text: str,
+    whisper_text: str,
+    labels: list[int],
+    prompt_len: int,
+    min_similarity: float,
+    corpus_freq: Counter | None,
+    max_common_freq: int,
+) -> int:
+    """Sets labels[i] = -100 for target tokens that fall inside a low-signal
+    correction span (see low_signal_word_spans) -- corrections that aren't
+    guessable from context, which we don't want to train the model to
+    reproduce by memorization or, worse, teach it to guess at randomly (this
+    is a property of Whisper's failures on that word, not something we want
+    the model to learn to do).
+
+    Maps low_signal_word_spans' character spans (computed over target_text)
+    to token positions via the tokenizer's offset mapping, tokenizing
+    target_text standalone and locating those token ids as a contiguous
+    subsequence within `labels[prompt_len:]` -- NOT assumed to start exactly
+    at prompt_len, since some chat templates insert boilerplate between the
+    prompt and the actual assistant content (e.g. Qwen3's chat template adds
+    an empty "<think>\\n\\n</think>\\n\\n" block there even when the message
+    itself has no such content). Falls back to no masking (safe/
+    conservative) if the subsequence isn't found at all, e.g. a row
+    truncated mid-target.
+
+    Returns the number of tokens masked this way.
+    """
+    spans = low_signal_word_spans(whisper_text, target_text, min_similarity, corpus_freq, max_common_freq)
+    if not spans:
+        return 0
+
+    target_enc = tokenizer(target_text, add_special_tokens=False, return_offsets_mapping=True)
+    target_ids = target_enc["input_ids"]
+    target_offsets = target_enc["offset_mapping"]
+
+    offset = _find_subsequence(labels[prompt_len:], target_ids)
+    if offset == -1:
+        return 0
+    start = prompt_len + offset
+
+    masked = 0
+    for i, (char_start, char_end) in enumerate(target_offsets):
+        if char_start == char_end:
+            continue
+        if any(char_start < span_end and char_end > span_start for span_start, span_end in spans):
+            labels[start + i] = -100
+            masked += 1
+    return masked
+
+
 def build_example(
     tokenizer: PreTrainedTokenizerBase,
     whisper_text: str,
@@ -137,6 +333,10 @@ def build_example(
     max_length: int,
     system_prompt: str = SYSTEM_PROMPT,
     on_long_example: str = "drop",
+    mask_low_signal_corrections: bool = False,
+    mask_min_similarity: float = 0.75,
+    mask_corpus_freq: Counter | None = None,
+    mask_max_common_freq: int = 1,
 ) -> dict:
     """Tokenize one (whisper_text -> target_text) pair with loss masked to the target span.
 
@@ -150,7 +350,8 @@ def build_example(
     ("ok", "truncated", or "dropped") -- callers should filter out "dropped"
     rows (train.py does this after `.map()`; every row must return the same
     schema during the map itself, so a dropped row still gets placeholder
-    tensor fields).
+    tensor fields) -- and a `masked_low_signal_tokens` count (always 0 unless
+    `mask_low_signal_corrections` is set).
 
     `on_long_example` controls what happens when the full prompt+target
     exceeds `max_length`:
@@ -161,6 +362,18 @@ def build_example(
     A row is always dropped regardless of this setting if the prompt alone
     already exceeds max_length -- truncating would leave zero target tokens
     to compute loss on, i.e. an example with no training signal at all.
+
+    `mask_low_signal_corrections`, if set, additionally masks out (labels =
+    -100) the target tokens for any word-level correction that
+    low_signal_word_spans() flags as not recoverable from context (see its
+    docstring) -- so the model isn't trained to reproduce, or implicitly
+    rewarded/penalized for guessing at, a correction with no real signal in
+    the input. Everything else in the target -- correct passthrough text and
+    guessable corrections alike -- still trains normally. `mask_corpus_freq`/
+    `mask_max_common_freq` are passed straight through to
+    low_signal_word_spans() as its frequency gate -- without it, phonetic
+    similarity alone flags mostly common function/filler words, not names
+    (see that function's docstring).
     """
     if on_long_example not in ("drop", "truncate"):
         raise ValueError(f"on_long_example must be 'drop' or 'truncate', got {on_long_example!r}")
@@ -199,11 +412,19 @@ def build_example(
     mask_len = min(len(prompt_ids), len(kept_ids))
     labels[:mask_len] = [-100] * mask_len
 
+    masked_low_signal_tokens = 0
+    if mask_low_signal_corrections and status != "dropped":
+        masked_low_signal_tokens = _mask_low_signal_spans(
+            tokenizer, target_text, whisper_text, labels, len(prompt_ids), mask_min_similarity,
+            mask_corpus_freq, mask_max_common_freq,
+        )
+
     return {
         "input_ids": kept_ids,
         "attention_mask": [1] * len(kept_ids),
         "labels": labels,
         "status": status,
+        "masked_low_signal_tokens": masked_low_signal_tokens,
     }
 
 

@@ -37,6 +37,12 @@ max_length: 2048
 # Rows too long for max_length are dropped, not truncated into the target
 # (see README) -- train.py prints how many were kept/truncated/dropped.
 on_long_example: drop   # drop | truncate
+# Feature flag -- see README's "Low-signal correction masking" section.
+# Masks out (no loss) target words Whisper's output gives no real signal
+# for recovering, so the model isn't trained to guess those at random.
+mask_low_signal_corrections: false
+mask_min_similarity: 0.75
+mask_max_common_freq: 1
 
 training:
   # 2, not 3: research on LoRA SFT (Raschka's empirical study) found extra

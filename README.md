@@ -233,6 +233,9 @@ raises an error immediately rather than being silently ignored:
   `--assembled-target-frac`, since assembled (full-channel) rows are much
   longer than chunked ones and a higher assembled share means more of them
   can exceed `max_length` and get dropped exactly where they matter most.
+- `mask_low_signal_corrections` / `mask_min_similarity` /
+  `mask_max_common_freq`: opt-in feature flag to mask un-guessable
+  corrections out of the loss -- see "Low-signal correction masking" below.
 - `training.*`: epochs, batch size, learning rate, save/eval cadence, etc.
 - `lora.*`: LoRA rank/alpha/dropout.
 - `quantization.load_in_4bit`: QLoRA; needs `bitsandbytes` + a CUDA GPU.
@@ -511,6 +514,73 @@ across punctuated vs. punctuation-free runs -- a word-level WER treats
 `"سلام،"` and `"سلام"` as different tokens, so every sentence-boundary guess
 the model gets even slightly wrong counts as a full word error on top of
 whatever content/entity errors it also made.
+
+### Low-signal correction masking
+
+Some of what's in the training targets is genuinely un-guessable from what
+Whisper produced: a name mis-heard as a completely unrelated word, with no
+phonetic or character-level overlap to recover from. Training on those rows
+as-is means the loss rewards the model for memorizing the correct answer for
+that specific call, but for a *new* call with the same kind of failure,
+there's no signal in the input pointing to the fix -- the model can only
+guess, and training it to output a specific guess anyway just teaches it to
+guess confidently. That's a property of Whisper's failure on that word, not
+something worth reinforcing.
+
+`mask_low_signal_corrections: true` masks those spans out of the loss
+(`labels = -100`) at the token level, leaving everything else --
+correct passthrough text and *guessable* corrections alike -- training
+normally. "Guessable" is decided by `data.py`'s `low_signal_word_spans()`:
+for each word-level alignment error between `whisper_text` and the target,
+compute a phonetic similarity between what Whisper said and the correct
+word, normalizing well-documented Persian homophone letter groups first
+(ز/ذ/ض/ظ, س/ص/ث, ت/ط, ق/غ, ح/ه -- deliberately not ک/گ, which aren't true
+homophones) so a real homophone slip isn't penalized just for sharing few
+raw characters with the correction. A word Whisper produced *nothing* for
+at all (a "delete"-type alignment chunk) has no Whisper-side content to
+compare against, so it's always treated as unguessable regardless of
+`mask_min_similarity` -- **unless** the frequency gate below rules it out.
+
+Phonetic similarity alone isn't enough, though: tested directly against the
+curated training set, it flagged mostly common function/filler words
+("رو", "بله", "و", "هم", "خب"), not names -- a dropped "بله" (yes) scores
+the same 0.0 similarity as a dropped name, even though it's trivially
+predictable from Persian dialogue structure regardless of what Whisper
+produced. `low_signal_word_spans()` also takes a corpus-wide word-frequency
+count (`train.py` builds this once over every training target before
+tokenizing) and only masks a span if at least one of its words occurs at
+most `mask_max_common_freq` times in it -- a span made up entirely of common
+words is left in the loss. Verified on an 800-row sample: this cut the
+share of examples with any masking from 89% to 52% and total masked tokens
+by ~83%, and the masked spans left afterward were genuinely names
+("شاهرخی", "صفایی‌فر", "حسن‌پور") and rare content words ("مالیات",
+"مصاحبه", "سومین"), not routine dictation-error vocabulary.
+
+```bash
+python src/train.py --config configs/qwen3.5-2b.yaml \
+  --set mask_low_signal_corrections=true \
+  --set output_dir=./outputs/qwen3.5-2b-masked
+```
+
+`mask_min_similarity` (default `0.75`) controls the phonetic cutoff --
+tuned on a small hand-checked sample to cleanly separate known-guessable
+pairs (>= 0.833: homophone substitutions, ZWNJ/spacing-only differences)
+from known-unguessable ones (<= 0.714); treat it as a starting point, not a
+precise threshold. `mask_max_common_freq` (default `1`) is the frequency
+gate's cutoff -- a word occurring at most this many times across the whole
+training set counts as rare. `train.py` prints how many target tokens got
+masked out this way after tokenizing, alongside the existing
+kept/truncated/dropped counts.
+
+The token-to-span mapping is done via the tokenizer's offset mapping,
+locating the target's token ids as a subsequence inside the full tokenized
+example rather than assuming they start immediately after the prompt --
+some chat templates insert boilerplate there (e.g. Qwen3's template adds an
+empty `<think>\n\n</think>\n\n` block even when the message itself has no
+thinking content). If that subsequence search fails for some row (observed
+only for a row truncated mid-target), masking is silently skipped for that
+row rather than approximated -- the row still trains normally, just without
+this extra masking.
 
 ### Best checkpoint by WER
 

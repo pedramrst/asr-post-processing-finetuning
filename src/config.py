@@ -100,6 +100,23 @@ class Config:
     # the target. A row is always dropped regardless of this setting if the
     # prompt alone exceeds max_length (no room left for any target token).
     on_long_example: str = "drop"
+    # Masks (labels = -100) target tokens for word-level corrections that
+    # aren't recoverable from what Whisper actually produced -- see
+    # data.py's low_signal_word_spans()/build_example() and README's
+    # "Low-signal correction masking" section. Off by default: opt in to
+    # test it against the baseline of training on every corrected word.
+    mask_low_signal_corrections: bool = False
+    # Phonetic/character similarity threshold (0-1, higher = stricter) below
+    # which a correction is masked out -- see low_signal_word_spans().
+    mask_min_similarity: float = 0.75
+    # A phonetically-dissimilar correction is only masked if at least one of
+    # its words occurs at most this many times across the whole training
+    # set (train.py builds this count once before tokenizing) -- without
+    # this gate, phonetic similarity alone flags mostly common function/
+    # filler words ("رو", "بله", "و"), not names, since a word Whisper
+    # produced nothing for always scores 0 similarity by construction
+    # regardless of how common it is. See low_signal_word_spans().
+    mask_max_common_freq: int = 1
 
     num_train_epochs: float = 3.0
     per_device_train_batch_size: int = 4

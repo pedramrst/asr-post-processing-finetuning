@@ -201,7 +201,15 @@ def main() -> None:
         print(f"train_fraction={cfg.train_fraction}: using {len(raw['train'])} train rows")
 
     length_stats = Counter()
+    masked_low_signal_tokens_total = 0
+    masked_low_signal_examples = 0
     system_prompt = resolve_system_prompt(cfg)
+
+    mask_corpus_freq = None
+    if cfg.mask_low_signal_corrections:
+        mask_corpus_freq = Counter()
+        for text in raw["train"][cfg.target_column]:
+            mask_corpus_freq.update(text.split())
 
     def _map(example):
         result = build_example(
@@ -211,8 +219,16 @@ def main() -> None:
             max_length=cfg.max_length,
             on_long_example=cfg.on_long_example,
             system_prompt=system_prompt,
+            mask_low_signal_corrections=cfg.mask_low_signal_corrections,
+            mask_min_similarity=cfg.mask_min_similarity,
+            mask_corpus_freq=mask_corpus_freq,
+            mask_max_common_freq=cfg.mask_max_common_freq,
         )
         length_stats[result["status"]] += 1
+        nonlocal masked_low_signal_tokens_total, masked_low_signal_examples
+        if result["masked_low_signal_tokens"]:
+            masked_low_signal_tokens_total += result["masked_low_signal_tokens"]
+            masked_low_signal_examples += 1
         return result
 
     tokenized = raw.map(_map, remove_columns=raw["train"].column_names)
@@ -223,9 +239,16 @@ def main() -> None:
         f"{length_stats['ok']} ok, {length_stats['truncated']} truncated, "
         f"{length_stats['dropped']} dropped (exceeded max_length={cfg.max_length})"
     )
+    if cfg.mask_low_signal_corrections:
+        print(
+            f"Low-signal correction masking (min_similarity={cfg.mask_min_similarity}, "
+            f"max_common_freq={cfg.mask_max_common_freq}): "
+            f"{masked_low_signal_tokens_total} target tokens masked out of loss across "
+            f"{masked_low_signal_examples} examples"
+        )
     if length_stats["dropped"]:
         tokenized = tokenized.filter(lambda ex: ex["status"] != "dropped")
-    tokenized = tokenized.remove_columns("status")
+    tokenized = tokenized.remove_columns(["status", "masked_low_signal_tokens"])
 
     collator = PadCollator(pad_token_id=tokenizer.pad_token_id)
 
