@@ -761,7 +761,7 @@ decides to type":
 | Process control | `check_training_status`, `stop_training`, `run_finetune`, `resume_training` |
 | Config | `edit_config`, `get_effective_config`, `validate_config` |
 | Data & checkpoints | `build_data`, `list_checkpoints`, `check_hf_upload`, `sync_to_hub` |
-| Results & metrics | `get_checkpoint_metrics`, `get_secondary_eval_metrics`, `sample_predictions`, `query_predictions`, `compare_runs` |
+| Results & metrics | `get_checkpoint_metrics`, `get_secondary_eval_metrics`, `sample_predictions`, `query_predictions`, `compare_runs`, `list_available_metrics`, `plot_metrics` |
 | Sweeps | `run_sweep` |
 | Operational health | `check_gpu`, `check_disk_usage`, `tail_log` |
 
@@ -771,6 +771,30 @@ fields and comparison operators) -- not an arbitrary expression or code
 string. This is the one place a careless design could reintroduce
 uncontrolled code execution; keeping it a constrained mini-DSL
 (`tools.apply_prediction_filter`, unit-tested) is deliberate.
+
+`plot_metrics` reads TensorBoard's scalar logs (`tensorboard.backend.
+event_processing.event_accumulator.EventAccumulator`, reading from
+wherever that run's own `config.yaml` points `tensorboard.logging_dir`,
+defaulting to `<output_dir>/tb`), renders a chart with `matplotlib`
+(headless `Agg` backend), and sends the PNG straight to Telegram via
+`sendPhoto` -- it does **not** return the image through its own tool-result
+text the way every other tool does. There's no reason for the model itself
+to see raw pixel data; the tool's text return is just a short numeric
+summary so the model can still talk about what it sent. With no `tags`
+given, it auto-picks the first of `test/wer`/`test/best_wer`/
+`test/entity_wer`/`test/typo_wer`/`eval/loss`/`train/loss` that actually has
+data -- note the `/`, not `_`: HF Trainer's `TensorBoardCallback` renames
+every logged key through `rewrite_logs()` before writing it (`eval_x` ->
+`eval/x`, `test_x` -> `test/x`, everything else, including Trainer's own
+internal training-step `loss`, -> `train/x`), verified directly against the
+installed transformers version rather than assumed -- passing explicit
+`tags` plots all of them together on one chart (for a deliberate
+comparison, e.g. aggregate vs. entity-slice WER, or `train/loss` vs.
+`eval/loss` to check for overfitting).
+`list_available_metrics` (also shares `_tb_available_tags`) lists every
+scalar tag a run actually has -- e.g. ask "what plots are available for
+this run" and then "send me the hallucination rate one," which the model
+resolves back to the matching tag name from what it just listed.
 
 ### Confirmation
 

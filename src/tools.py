@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import supervise  # noqa: E402
 from config import load_config  # noqa: E402
 from hub_sync import sync_output_dir  # noqa: E402
-from notify import send_telegram_message  # noqa: E402
+from notify import send_telegram_message, send_telegram_photo  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -519,6 +519,139 @@ def compare_runs(output_dir_a: str, output_dir_b: str) -> str:
     return json.dumps({output_dir_a: snapshot(output_dir_a), output_dir_b: snapshot(output_dir_b)}, indent=2)
 
 
+def _tb_dir_for(output_dir: str) -> Path:
+    """The run's actual TensorBoard directory -- reads it back from the
+    run's own config.yaml (tensorboard.logging_dir) rather than assuming
+    the default, since that field can be overridden per-config; falls back
+    to <output_dir>/tb (train.py's own default) if config.yaml is missing
+    or doesn't set it.
+    """
+    config_path = Path(output_dir) / "config.yaml"
+    if config_path.exists():
+        try:
+            cfg = load_config(config_path)
+            if cfg.tensorboard_logging_dir:
+                return Path(cfg.tensorboard_logging_dir)
+        except Exception:
+            pass
+    return Path(output_dir) / "tb"
+
+
+# These are namespaced with "/", not "_" -- HF Trainer's TensorBoardCallback
+# runs every logged dict through rewrite_logs() before writing scalars,
+# which renames any "eval_x" key to "eval/x", "test_x" to "test/x", and
+# everything else (including Trainer's own internal "loss" from the
+# training loop) to "train/x" -- verified directly against the installed
+# transformers version's actual rewrite_logs(), not assumed. So "test_wer"
+# (what train.py/evaluate.py actually call trainer.log() with) really lands
+# in TensorBoard as "test/wer", and Trainer's internal per-step training
+# loss (key "loss") lands as "train/loss", never "train_loss".
+_DEFAULT_TAG_PRIORITY = ["test/wer", "test/best_wer", "test/entity_wer", "test/typo_wer", "eval/loss", "train/loss"]
+
+
+def _tb_available_tags(tb_dir: Path) -> list[str]:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    ea = EventAccumulator(str(tb_dir))
+    ea.Reload()
+    return sorted(ea.Tags().get("scalars", []))
+
+
+def _read_tb_scalars(tb_dir: Path, tag: str) -> list[tuple[int, float]]:
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    ea = EventAccumulator(str(tb_dir), size_guidance={"scalars": 0})  # 0 -> load every point, not a sample
+    ea.Reload()
+    if tag not in ea.Tags().get("scalars", []):
+        return []
+    return [(e.step, e.value) for e in ea.Scalars(tag)]
+
+
+@beta_tool
+def list_available_metrics(output_dir: str) -> str:
+    """Lists every TensorBoard scalar metric tag available for a run --
+    call this first to see what's plottable, then pass the ones you want
+    to plot_metrics's `tags` argument.
+
+    Args:
+        output_dir: The run's output directory.
+    """
+    tb_dir = _tb_dir_for(output_dir)
+    if not tb_dir.exists():
+        return f"No TensorBoard directory found at {tb_dir}"
+    tags = _tb_available_tags(tb_dir)
+    if not tags:
+        return f"No scalar metrics found under {tb_dir}"
+    return json.dumps(tags)
+
+
+@beta_tool
+def plot_metrics(output_dir: str, tags: list[str] | None = None, title: str | None = None) -> str:
+    """Renders a chart of one or more TensorBoard scalar metrics over
+    training steps and sends it directly to Telegram as an image (not
+    through this tool's own text return, since there's no reason for the
+    model itself to see pixel data -- only the user needs the picture).
+
+    Args:
+        output_dir: The run's output directory (TensorBoard logs are read
+            from wherever that run's own config.yaml points
+            tensorboard.logging_dir, defaulting to <output_dir>/tb).
+        tags: Which scalar tags to plot together on one chart, e.g.
+            ["test/wer", "test/entity_wer"] or ["train/loss", "eval/loss"]
+            (note the "/" -- HF Trainer namespaces logged metrics this way,
+            not with "_"; call list_available_metrics first if unsure of
+            the exact tag name). Leave empty to auto-pick from whatever of
+            test/wer, test/best_wer, test/entity_wer, test/typo_wer,
+            eval/loss, train/loss is actually present.
+        title: Optional chart title. Defaults to output_dir's basename.
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # headless -- no display on the training box
+    import matplotlib.pyplot as plt
+
+    tb_dir = _tb_dir_for(output_dir)
+    if not tb_dir.exists():
+        return f"No TensorBoard directory found at {tb_dir}"
+
+    candidate_tags = tags or _DEFAULT_TAG_PRIORITY
+    series_by_tag = {}
+    for tag in candidate_tags:
+        points = _read_tb_scalars(tb_dir, tag)
+        if points:
+            series_by_tag[tag] = points
+        if not tags and series_by_tag:
+            # Auto-pick mode: stop at the first priority tag(s) that
+            # actually has data rather than dumping every metric on one
+            # chart -- explicit `tags` from the caller are all plotted
+            # regardless, since that's a deliberate comparison request.
+            break
+
+    if not series_by_tag:
+        available = _tb_available_tags(tb_dir)
+        return f"No matching scalar data under {tb_dir} for tags={candidate_tags}. Available scalar tags: {available}"
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for tag, points in series_by_tag.items():
+        steps, values = zip(*points)
+        ax.plot(steps, values, marker=".", label=tag)
+    ax.set_xlabel("step")
+    ax.set_ylabel("value")
+    ax.set_title(title or Path(output_dir).name)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    out_path = Path(output_dir) / "agent_chart.png"
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
+
+    caption = f"{Path(output_dir).name}: " + ", ".join(series_by_tag.keys())
+    sent = send_telegram_photo(str(out_path), caption=caption)
+    summary = {tag: {"n_points": len(pts), "latest": pts[-1][1], "min": min(v for _, v in pts), "max": max(v for _, v in pts)}
+               for tag, pts in series_by_tag.items()}
+    return f"{'Sent' if sent else 'Rendered (Telegram send failed, see logs)'} chart for {list(series_by_tag)}. Summary: {json.dumps(summary)}"
+
+
 # --------------------------------------------------------------------------
 # Sweeps
 # --------------------------------------------------------------------------
@@ -596,7 +729,7 @@ ALL_TOOLS = [
     edit_config, get_effective_config, validate_config,
     build_data, list_checkpoints, check_hf_upload, sync_to_hub,
     get_checkpoint_metrics, get_secondary_eval_metrics, sample_predictions,
-    query_predictions, compare_runs,
+    query_predictions, compare_runs, plot_metrics, list_available_metrics,
     run_sweep,
     check_gpu, check_disk_usage, tail_log,
 ]

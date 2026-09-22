@@ -54,6 +54,44 @@ def send_telegram_message(text: str) -> bool:
         return False
 
 
+def send_telegram_photo(image_path: str, caption: str = "") -> bool:
+    """Sends a local image file to TELEGRAM_CHAT_ID. Same best-effort
+    contract as send_telegram_message -- returns whether it actually sent,
+    never raises.
+
+    Args:
+        image_path: Path to a local image file (e.g. a PNG chart).
+        caption: Optional caption shown under the image (Telegram's own
+            caption length limit is smaller than sendMessage's, 1024 chars --
+            truncated here rather than rejected by the API).
+    """
+    token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("notify: TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set, skipping photo")
+        return False
+
+    if len(caption) > 1024:
+        caption = caption[:1000] + "\n...[truncated]"
+
+    url = _API_BASE.format(token=token, method="sendPhoto")
+    try:
+        with open(image_path, "rb") as f:
+            resp = requests.post(
+                url, data={"chat_id": chat_id, "caption": caption},
+                files={"photo": f}, timeout=30,
+            )
+        if resp.status_code == 429:
+            retry_after = resp.json().get("parameters", {}).get("retry_after")
+            print(f"notify: rate-limited by Telegram, retry_after={retry_after}s, dropping this photo")
+            return False
+        resp.raise_for_status()
+        return True
+    except (requests.RequestException, OSError) as e:
+        print(f"notify: failed to send Telegram photo: {e}")
+        return False
+
+
 def get_telegram_updates(offset: int | None, timeout: int = 30) -> list[dict]:
     """Long-polls Telegram's getUpdates. `offset` should be the highest
     update_id seen so far + 1 (Telegram's own pagination convention -- passing

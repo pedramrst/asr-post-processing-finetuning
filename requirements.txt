@@ -20,6 +20,9 @@ requests
 # plain PyYAML's safe_load/safe_dump silently deletes every comment and
 # reformats values on a load+dump round-trip (verified directly)
 ruamel.yaml
+# needed for tools.py's plot_metrics (renders TensorBoard scalars to a PNG
+# sent to Telegram) -- also used, optionally, by the exploration notebook
+matplotlib
 # only needed if training with --load_in_4bit (QLoRA) on a CUDA GPU
 # bitsandbytes
 # only needed if training with use_unsloth: true (see README's "Unsloth"
@@ -34,6 +37,5 @@ ruamel.yaml
 # flash-linear-attention
 # only needed to open/run notebooks/explore_finetuning_data.ipynb
 # pandas
-# matplotlib
 # ipykernel
 # nbconvert
