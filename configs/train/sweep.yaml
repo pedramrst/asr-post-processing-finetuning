@@ -5,7 +5,7 @@
 #
 # Currently just the two models actually being fine-tuned right now
 # (Qwen3.5-2B and gemma-3-1b-it) -- Qwen3-1.7B and gemma-4-E2B-it are on
-# hold, not removed; add jobs back for them (config: configs/base.yaml for
+# hold, not removed; add jobs back for them (config: configs/train/base.yaml for
 # Qwen3-1.7B, a new dedicated config for gemma-4-E2B-it -- see its own batch
 # sizing note from the GPU discussion) when/if they're back in scope.
 #
@@ -25,7 +25,7 @@ output_root: ./outputs/model-comparison
 
 jobs:
   - name: qwen3.5-2b
-    config: configs/qwen3.5-2b.yaml
+    config: configs/train/qwen3.5-2b.yaml
 
   - name: gemma-3-1b-it
-    config: configs/gemma-3-1b-it.yaml
+    config: configs/train/gemma-3-1b-it.yaml

@@ -1,0 +1,36 @@
+# Data-prep config for src/build_data.py -- controls where the training
+# dataset comes from. See README.md's "Data config" section.
+#
+# source: prebuilt
+#   Use an already-built-and-curated dataset published to a Hub dataset
+#   repo (prebuilt.dataset_id). build_data.py just confirms the repo is
+#   reachable; nothing gets built or downloaded locally -- point a train
+#   config's training.dataset_id at prebuilt.dataset_id directly.
+#
+# source: build
+#   (Re)build the dataset from raw ErfanRou/callcc-2k via build_dataset.py,
+#   then curate it via prepare_split.py, using the build/build.prepare
+#   sections below as those scripts' CLI flags (see their own docstrings
+#   for what each one does and why it defaults where it does).
+source: prebuilt
+
+prebuilt:
+  dataset_id: PedramR/ASR_Post-processing-dataset
+
+build:
+  # Production corrects one full call channel at a time, so assembled rows
+  # should dominate the raw data -- see build_dataset.py's docstring.
+  assembled_ratio: 0.9
+  seed: 42
+
+  prepare:
+    wer_cap: 1.0
+    overlap_floor: 30.0
+    agree_target_frac: 0.225
+    assembled_target_frac: 0.85
+    entity_target_frac: 0.5
+    entity_min_name_word_len: 3
+    entity_confidence_max: 0.45
+    entity_confidence_max_freq: 3
+    entity_max_repeats: 5
+    seed: 42

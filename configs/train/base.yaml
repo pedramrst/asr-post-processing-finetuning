@@ -41,8 +41,21 @@ on_long_example: drop   # drop | truncate
 # Masks out (no loss) target words Whisper's output gives no real signal
 # for recovering, so the model isn't trained to guess those at random.
 mask_low_signal_corrections: false
+# These two also govern evaluate.py's fix_rate_recoverable (which drops the
+# same unrecoverable corrections from its denominator) regardless of the
+# flag above -- see README's "Test-set evaluation". They're also reused by
+# recoverable_correction_weight below, to decide the same "is this word
+# guessable" question -- both features share one set of thresholds rather
+# than risking two configs disagreeing about the same word.
 mask_min_similarity: 0.75
 mask_max_common_freq: 1
+# Feature flag -- see README's "Recoverable-correction up-weighting"
+# section. 1.0 (the default) is a no-op -- every target token trains at
+# normal weight. Raise it to give recoverable corrections (Whisper wrong,
+# but guessable) extra weight in the loss, on the theory that they're a
+# small minority of any example's tokens. Independent of
+# mask_low_signal_corrections above -- either can be on without the other.
+recoverable_correction_weight: 1.0
 
 # Loads the base model + sets up LoRA via Unsloth's FastLanguageModel instead
 # of plain transformers + peft -- reported ~2x faster training and ~70% less
@@ -115,6 +128,13 @@ test:
   # target: the model already handles this error category well, so the
   # point is catching if pushing harder on entities erodes it.
   typo_dataset_id: null
+  # Weight on fix_rate vs. preservation_rate in targeted_score -- see
+  # README's "Test-set evaluation". 0.5 (equal weight) is the starting
+  # point; raise it to prioritize catching more errors even at some
+  # over-correction risk, lower it to prioritize not touching text that
+  # was already fine. fix_rate/preservation_rate are always reported
+  # unweighted too, regardless of this.
+  fix_weight: 0.5
 
 # false | true (resume from the latest checkpoint under output_dir) |
 # a local checkpoint path | "hub" to pull this run's folder from hub.repo_id first

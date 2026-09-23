@@ -9,11 +9,18 @@
 #   ./run.sh smoke   (default) tiny end-to-end check: small local data slice,
 #                     1 epoch, low save_steps -- exercises train/save/hub-sync/
 #                     test-eval/WER cheaply before you commit to a real run.
-#   ./run.sh build    (Re)build + curate the full training dataset only.
+#   ./run.sh build    (Re)build + curate the full training dataset only, per
+#                     configs/data/default.yaml's `build` section (set
+#                     DATA_CONFIG to use a different data config; set
+#                     ASSEMBLED_RATIO to override its assembled_ratio without
+#                     editing the file). If that config's `source` is
+#                     `prebuilt` instead, there's nothing to build -- point a
+#                     train config's training.dataset_id at its
+#                     prebuilt.dataset_id directly and skip this mode.
 #   ./run.sh train <config> [--set key=value ...]
 #                     Train just one config, e.g. `./run.sh train qwen3.5-2b`
 #                     or `./run.sh train gemma-3-1b-it` (bare names resolve to
-#                     configs/<name>.yaml; a path to any .yaml file also
+#                     configs/train/<name>.yaml; a path to any .yaml file also
 #                     works). Anything after <config> is forwarded to
 #                     train.py, e.g. `./run.sh train qwen3.5-2b --set
 #                     train_fraction=0.1 --set output_dir=./outputs/qwen-10pct`
@@ -21,8 +28,9 @@
 #                     dataset was already built (run `build` first). Unlike
 #                     `sweep`, output_dir/hub.folder come straight from that
 #                     config file, not auto-namespaced.
-#   ./run.sh sweep    Run the model comparison (configs/sweep.yaml). Assumes
-#                     the full dataset was already built (run `build` first).
+#   ./run.sh sweep    Run the model comparison (configs/train/sweep.yaml).
+#                     Assumes the full dataset was already built (run `build`
+#                     first).
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
 #                     run `smoke` first if you haven't already.
 #   ./run.sh agent    Start the Telegram + LLM tool-calling operations agent
@@ -42,6 +50,7 @@ CONFIG_ARG="${2:-}"
 # docstring. prepare_split.py's --assembled-target-frac then balances the
 # curated split from whatever this produces.
 ASSEMBLED_RATIO="${ASSEMBLED_RATIO:-0.9}"
+DATA_CONFIG="${DATA_CONFIG:-configs/data/default.yaml}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_DIR"
 
@@ -54,7 +63,7 @@ case "$MODE" in
     if [ -z "$CONFIG_ARG" ]; then
       echo "Usage: ./run.sh train <config-name-or-path>" >&2
       echo "Available configs:" >&2
-      ls configs/*.yaml | sed 's/^/  /' >&2
+      ls configs/train/*.yaml | sed 's/^/  /' >&2
       exit 1
     fi
     ;;
@@ -151,7 +160,7 @@ if [ ! -f .env ]; then
     cat >&2 <<'MSG'
 No .env and no HF_TOKEN environment variable set. Either:
   - copy .env.example to .env and fill in a token with write access to the
-    hub.repo_id configured in your configs (see configs/base.yaml), or
+    hub.repo_id configured in your configs (see configs/train/base.yaml), or
   - set HF_TOKEN in this shell (e.g. via Vast's instance environment
     variables) before running this script.
 Aborting.
@@ -161,18 +170,19 @@ MSG
 fi
 
 run_build() {
-  log "Building dataset (--assembled-ratio $ASSEMBLED_RATIO)"
-  python src/build_dataset.py --assembled-ratio "$ASSEMBLED_RATIO" --output-dir ./asr_dataset.jsonl
-  log "Curating dataset"
-  python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_curated.jsonl
+  log "Building dataset ($DATA_CONFIG, --set build.assembled_ratio=$ASSEMBLED_RATIO)"
+  python src/build_from_config.py --config "$DATA_CONFIG" --set source=build \
+    --set build.assembled_ratio="$ASSEMBLED_RATIO" \
+    --raw-output ./asr_dataset.jsonl --output ./asr_dataset_curated.jsonl
 }
 
 run_smoke() {
   log "Building smoke-test data slice (50 calls)"
-  python src/build_dataset.py --assembled-ratio "$ASSEMBLED_RATIO" --max-calls 50 --output-dir ./asr_dataset_smoke.jsonl
-  python src/prepare_split.py --input ./asr_dataset_smoke.jsonl --output ./asr_dataset_smoke_curated.jsonl
-  log "Running smoke-test training (configs/smoke.yaml)"
-  python src/train.py --config configs/smoke.yaml
+  python src/build_from_config.py --config "$DATA_CONFIG" --set source=build \
+    --set build.assembled_ratio="$ASSEMBLED_RATIO" --set build.max_calls=50 \
+    --raw-output ./asr_dataset_smoke.jsonl --output ./asr_dataset_smoke_curated.jsonl
+  log "Running smoke-test training (configs/train/smoke.yaml)"
+  python src/train.py --config configs/train/smoke.yaml
   log "Smoke test complete -- check outputs/smoke-test/ and the 'smoke-test' folder in your Hub repo."
 }
 
@@ -181,8 +191,8 @@ run_sweep() {
     echo "./asr_dataset_curated.jsonl not found -- run './run.sh build' first." >&2
     exit 1
   fi
-  log "Running model comparison sweep (configs/sweep.yaml)"
-  python src/run_sweep.py --sweep configs/sweep.yaml
+  log "Running model comparison sweep (configs/train/sweep.yaml)"
+  python src/run_sweep.py --sweep configs/train/sweep.yaml
 }
 
 run_agent() {
@@ -205,20 +215,20 @@ run_agent() {
 run_train() {
   local cfg="$1" config_path
   shift
-  # Accept a bare name (resolved against configs/, with or without .yaml) or
-  # any path to a .yaml file, so both `./run.sh train qwen3.5-2b` and
-  # `./run.sh train configs/qwen3.5-2b.yaml` work. Anything after the config
-  # (e.g. `--set train_fraction=0.1 --set output_dir=...`) is forwarded
-  # straight to train.py.
+  # Accept a bare name (resolved against configs/train/, with or without
+  # .yaml) or any path to a .yaml file, so both `./run.sh train qwen3.5-2b`
+  # and `./run.sh train configs/train/qwen3.5-2b.yaml` work. Anything after
+  # the config (e.g. `--set train_fraction=0.1 --set output_dir=...`) is
+  # forwarded straight to train.py.
   if [ -f "$cfg" ]; then
     config_path="$cfg"
-  elif [ -f "configs/$cfg.yaml" ]; then
-    config_path="configs/$cfg.yaml"
-  elif [ -f "configs/$cfg" ]; then
-    config_path="configs/$cfg"
+  elif [ -f "configs/train/$cfg.yaml" ]; then
+    config_path="configs/train/$cfg.yaml"
+  elif [ -f "configs/train/$cfg" ]; then
+    config_path="configs/train/$cfg"
   else
     echo "Config not found: '$cfg'. Available configs:" >&2
-    ls configs/*.yaml | sed 's/^/  /' >&2
+    ls configs/train/*.yaml | sed 's/^/  /' >&2
     exit 1
   fi
   if [ ! -f ./asr_dataset_curated.jsonl ]; then

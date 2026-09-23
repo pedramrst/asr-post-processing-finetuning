@@ -80,14 +80,23 @@ test:
   # checkpoint saves in this run, that dwarfs training time itself. Adjust
   # if the trend signal is too noisy or still too slow.
   checkpoint_max_examples: 150
-  # Small (268-row), ground-truth-backed named-entity slice of
-  # callcc-test-1k -- see src/build_entity_eval_slice.py and README's
+  # Small, ground-truth-backed named-entity slice of callcc-test-1k (1,010
+  # rows -- CRM-confirmed names plus a teammate's Gemini entity extraction,
+  # see src/build_entity_eval_slice.py's --entities-dir) -- see README's
   # "Named-entity eval slice". Tracked separately (test_entity_wer etc.) so
   # weak entity correction can't hide inside the aggregate test_wer number.
-  entity_dataset_id: ./data/entity_eval_slice.jsonl
+  # Shares a repo with typo_dataset_id below -- see README's "Uploading the
+  # eval slices as one Hub dataset" -- entity_row_type filters back down to
+  # just this slice's rows.
+  entity_dataset_id: PedramR/ASR_Post-processing-eval
+  entity_row_type: entity
   # 358-row typo/dictation-form regression-guard slice -- see
   # src/build_typo_eval_slice.py. Tracks that entity upsampling doesn't
   # quietly erode the dictation-error correction that already works well.
-  typo_dataset_id: ./data/typo_eval_slice.jsonl
+  typo_dataset_id: PedramR/ASR_Post-processing-eval
+  typo_row_type: typo
+  # Weight on fix_rate vs. preservation_rate in targeted_score -- see
+  # README's "Test-set evaluation". 0.5 (equal weight) for now.
+  fix_weight: 0.5
 
 resume_from_checkpoint: false

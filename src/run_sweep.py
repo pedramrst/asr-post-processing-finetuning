@@ -1,11 +1,11 @@
 """Run a queue of training jobs sequentially, then compare their results.
 
-Each job in the sweep YAML (see configs/sweep.yaml) names its own config file
+Each job in the sweep YAML (see configs/train/sweep.yaml) names its own config file
 -- jobs don't have to share one base config, so a run that needs genuinely
 different settings (not just a couple of overridden values) just points at
 its own full YAML file. An optional `overrides` on top of that file still
 lets you tweak a couple of values without duplicating the whole thing (e.g.
-reusing configs/base.yaml for most jobs, only overriding model_id).
+reusing configs/train/base.yaml for most jobs, only overriding model_id).
 
 Jobs run one after another -- not in parallel -- since they share one GPU. A
 failed job doesn't stop the queue: it's recorded and the remaining jobs still
@@ -136,7 +136,7 @@ def _launch_followup(output_root: Path, winner: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--sweep", required=True, help="Path to a sweep YAML file (see configs/sweep.yaml).")
+    parser.add_argument("--sweep", required=True, help="Path to a sweep YAML file (see configs/train/sweep.yaml).")
     parser.add_argument("--train_script", default=str(Path(__file__).with_name("train.py")))
     args = parser.parse_args()
 

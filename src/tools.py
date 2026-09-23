@@ -141,7 +141,7 @@ def run_finetune(config_path: str, overrides: dict | None = None, confirmed: boo
     last checkpoint) -- see the training supervisor docs.
 
     Args:
-        config_path: Path to a YAML config, e.g. "configs/qwen3.5-2b.yaml".
+        config_path: Path to a YAML config, e.g. "configs/train/qwen3.5-2b.yaml".
         overrides: Optional nested dict of config overrides, e.g.
             {"training": {"num_train_epochs": 1.0}}. Leave empty to just use
             the config file as-is.
@@ -263,9 +263,10 @@ def validate_config(config_path: str) -> str:
 
 @beta_tool
 def list_configs() -> str:
-    """Lists every YAML config file under configs/, so you can see what's
-    available before inspecting, copying, or launching one."""
-    paths = sorted(glob.glob(str(REPO_ROOT / "configs" / "*.yaml")))
+    """Lists every YAML config file under configs/train/ and configs/data/,
+    so you can see what's available before inspecting, copying, or
+    launching one."""
+    paths = sorted(glob.glob(str(REPO_ROOT / "configs" / "*" / "*.yaml")))
     if not paths:
         return "No config files found under configs/"
     return "\n".join(str(Path(p).relative_to(REPO_ROOT)) for p in paths)
@@ -276,10 +277,10 @@ def get_config(config_path: str) -> str:
     """Returns a config file's full raw contents (comments included), e.g.
     to review one before editing or launching it. Distinct from
     get_effective_config, which reads back a *run's* already-resolved
-    config.yaml, not a source configs/*.yaml file that hasn't been run yet.
+    config.yaml, not a source configs/train/*.yaml file that hasn't been run yet.
 
     Args:
-        config_path: Path to the YAML config, e.g. "configs/qwen3.5-2b.yaml".
+        config_path: Path to the YAML config, e.g. "configs/train/qwen3.5-2b.yaml".
     """
     path = Path(config_path)
     if not path.exists():
@@ -346,47 +347,63 @@ def copy_config(source_config_path: str, new_config_path: str, updates: dict | N
 # --------------------------------------------------------------------------
 
 @beta_tool
-def build_data(assembled_ratio: float, output_name: str, max_calls: int | None = None, confirmed: bool = False) -> str:
-    """Builds and curates a fresh training dataset in the background (can
-    take tens of minutes for a full build -- returns immediately, sends a
-    Telegram message when it finishes).
+def build_data(config_path: str = "configs/data/default.yaml", output_name: str = "asr_dataset",
+                overrides: dict | None = None, confirmed: bool = False) -> str:
+    """Resolves or builds the training dataset from a data YAML config (see
+    build_from_config.py / configs/data/default.yaml).
+
+    For source: prebuilt, this just confirms the configured Hub dataset repo
+    is reachable and returns immediately -- nothing to build. For source:
+    build, it runs build_dataset.py + prepare_split.py in the background
+    (can take tens of minutes for a full build -- returns immediately, sends
+    a Telegram message when it finishes).
 
     Args:
-        assembled_ratio: Fraction (0-1) of calls emitted as full-channel
-            "assembled" rows rather than per-segment "chunked" rows.
-        output_name: Base name for the output files, e.g. "asr_dataset_v2"
-            -> writes ./asr_dataset_v2.jsonl and ./asr_dataset_v2_curated.jsonl.
-        max_calls: Optional cap on calls processed, for a quick smaller build.
+        config_path: Path to a data YAML config, e.g. "configs/data/default.yaml".
+        output_name: Base name for the output files when source: build, e.g.
+            "asr_dataset_v2" -> writes ./asr_dataset_v2.jsonl and
+            ./asr_dataset_v2_curated.jsonl. Ignored for source: prebuilt.
+        overrides: Optional nested dict of one-off config overrides, e.g.
+            {"build": {"assembled_ratio": 0.3, "max_calls": 50}} -- same
+            shape as run_finetune's overrides, applied on top of config_path
+            without editing the file.
         confirmed: Only pass True once the user has explicitly confirmed.
     """
+    path = REPO_ROOT / config_path
+    if not path.exists():
+        return f"No config file found at {config_path}"
+    cfg = _deep_merge(_make_ryaml().load(path.read_text()) or {}, overrides or {})
+    source = cfg.get("source")
+
     pending = _confirm_gate(
-        confirmed,
-        f"build a new dataset (assembled_ratio={assembled_ratio}, max_calls={max_calls}, output_name={output_name})",
+        confirmed, f"resolve/build data from {config_path} (source={source}, overrides={overrides or {}})",
     )
     if pending:
         return pending
 
+    set_args = supervise._overrides_to_set_args(overrides or {})
+    base_cmd = [sys.executable, str(REPO_ROOT / "src" / "build_from_config.py"),
+                "--config", config_path, *set_args]
+
+    if source == "prebuilt":
+        result = subprocess.run(base_cmd, cwd=str(REPO_ROOT), capture_output=True, text=True)
+        output = result.stdout if result.returncode == 0 else result.stderr
+        return output.strip() or f"build_from_config.py exited {result.returncode} with no output."
+
+    # source: build -- same background/Telegram-notify pattern as the old,
+    # config-less version of this tool: this can take tens of minutes, so it
+    # must not block the agent's response.
     raw_path = REPO_ROOT / f"{output_name}.jsonl"
     curated_path = REPO_ROOT / f"{output_name}_curated.jsonl"
     log_path = REPO_ROOT / f"{output_name}_build.log"
-
-    build_cmd = [sys.executable, str(REPO_ROOT / "src" / "build_dataset.py"),
-                 "--assembled-ratio", str(assembled_ratio), "--output-dir", str(raw_path)]
-    if max_calls is not None:
-        build_cmd += ["--max-calls", str(max_calls)]
-    curate_cmd = [sys.executable, str(REPO_ROOT / "src" / "prepare_split.py"),
-                  "--input", str(raw_path), "--output", str(curated_path)]
+    build_cmd = [*base_cmd, "--raw-output", str(raw_path), "--output", str(curated_path)]
 
     script = (
         f"import subprocess, sys\n"
         f"from notify import send_telegram_message\n"
-        f"r1 = subprocess.run({build_cmd!r})\n"
-        f"if r1.returncode != 0:\n"
-        f"    send_telegram_message('build_data: build_dataset.py failed, exit ' + str(r1.returncode))\n"
-        f"    sys.exit(1)\n"
-        f"r2 = subprocess.run({curate_cmd!r})\n"
-        f"msg = 'build_data finished: {raw_path} / {curated_path}' if r2.returncode == 0 else "
-        f"'build_data: prepare_split.py failed, exit ' + str(r2.returncode)\n"
+        f"r = subprocess.run({build_cmd!r})\n"
+        f"msg = 'build_data finished: {raw_path} / {curated_path}' if r.returncode == 0 else "
+        f"'build_data: build_from_config.py failed, exit ' + str(r.returncode)\n"
         f"send_telegram_message(msg)\n"
     )
     with open(log_path, "w") as logf:
@@ -743,7 +760,7 @@ def run_sweep(sweep_config: str, confirmed: bool = False) -> str:
     automatically continued with a longer follow-up run -- see run_sweep.py.
 
     Args:
-        sweep_config: Path to a sweep YAML, e.g. "configs/sweep.yaml".
+        sweep_config: Path to a sweep YAML, e.g. "configs/train/sweep.yaml".
         confirmed: Only pass True once the user has explicitly confirmed.
     """
     pending = _confirm_gate(confirmed, f"start a sweep from {sweep_config}")
