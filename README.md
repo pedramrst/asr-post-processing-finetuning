@@ -43,13 +43,13 @@ training into one entry point, and re-launches itself inside `tmux` so a
 dropped SSH connection doesn't kill a multi-hour run:
 
 ```bash
-./run.sh smoke                # default: tiny end-to-end check (see configs/smoke.yaml) --
+./run.sh smoke                # default: tiny end-to-end check (see configs/train/smoke.yaml) --
                                # exercises train/save/hub-sync/test-eval/WER cheaply before
                                # committing to a real run. Do this first.
 ./run.sh build                 # (re)build + curate the full training dataset
 ./run.sh train qwen3.5-2b      # train just one config -- needs `build` first (see below)
 ./run.sh train gemma-3-1b-it   # same, for the other config
-./run.sh sweep                 # the model comparison (configs/sweep.yaml) -- needs `build` first
+./run.sh sweep                 # the model comparison (configs/train/sweep.yaml) -- needs `build` first
 ./run.sh full                  # build + sweep back to back -- multi-hour, real GPU cost
 ```
 
@@ -62,54 +62,104 @@ running things manually/individually instead.
 ## Repo layout
 
 ```
-run.sh                  entry point for a fresh GPU instance -- see above
-configs/smoke.yaml      tiny end-to-end config used by `run.sh smoke`
-build_dataset.py       (in src/) downloads + preprocesses callcc-2k into a
-                        local .jsonl, column-pruned so audio is never fetched
-src/prepare_split.py    curates build_dataset.py's output: drops misaligned
-                        pairs, upsamples low-WER rows, balances assembled vs
-                        chunked rows, upsamples confirmed-named-entity rows
+run.sh                        entry point for a fresh GPU instance -- see above
+src/build_dataset.py          downloads + preprocesses callcc-2k into a local
+                               .jsonl, column-pruned so audio is never fetched
+src/prepare_split.py          curates build_dataset.py's output: drops
+                               misaligned pairs, upsamples low-WER rows,
+                               balances assembled vs chunked rows, upsamples
+                               confirmed-named-entity rows
+src/build_from_config.py      drives build_dataset.py + prepare_split.py (or
+                               resolves a prebuilt Hub dataset instead) from
+                               one configs/data/*.yaml file -- see "Data
+                               config" below
 src/build_entity_eval_slice.py, src/build_typo_eval_slice.py
-                        build the small held-out eval slices (named-entity,
-                        typo/dictation-form) from callcc-test-1k -- see
-                        "Named-entity eval slice"/"Typo/dictation-form eval
-                        slice" below
-src/data.py             dataset loading + tokenization/label-masking
-src/config.py           YAML config -> Config dataclass, with typo checking
-src/evaluate.py         runs the model on a test set, scores WER, saves
-                        input/output/reference/WER per row
-src/hub_sync.py         uploads a run's output_dir into its folder in the
-                        shared Hub repo (checkpoints, tb logs, config, test_eval)
-src/train.py            single training run (LoRA SFT)
-src/run_sweep.py        runs several training configs back-to-back, then
-                        compares them (by test WER, falling back to eval loss)
-                        -- auto-continues the winner with a follow-up run
-src/supervise.py        launches/monitors one training run as a detached
-                        process, with CUDA-OOM auto-recovery -- see
-                        "Telegram agent" below
-src/tools.py            the ~20 named operations the Telegram agent can
-                        call (process control, config, data/checkpoints,
-                        results, sweeps, GPU/disk health)
-src/notify.py           Telegram send/receive helpers
-src/telegram_agent.py   the agent's long-polling loop (`./run.sh agent`)
-configs/base.yaml       template/example single-run config (not currently
-                        used by sweep.yaml -- see below)
-configs/qwen3.5-2b.yaml, configs/gemma-3-1b-it.yaml
-                        standalone configs for the two models currently
-                        being fine-tuned, each sized for their own memory
-                        footprint rather than sharing base.yaml's
-configs/sweep.yaml      currently queues just those two models' configs
+                               build the small held-out eval slices
+                               (named-entity, typo/dictation-form) from
+                               callcc-test-1k -- see "Named-entity eval
+                               slice"/"Typo/dictation-form eval slice" below
+src/build_eval_dataset.py     combines both eval slices into one
+                               row_type-tagged dataset for a single shared
+                               Hub repo -- see "Uploading the eval slices as
+                               one Hub dataset" below
+src/data.py                   dataset loading + tokenization/label-masking
+src/persian_normalize.py      Persian dialectal-variation normalization for
+                               evaluate.py's *_lenient metrics (see
+                               "Test-set evaluation" below)
+src/config.py                 YAML config -> Config dataclass, with typo checking
+src/evaluate.py                runs the model on a test set, scores WER,
+                               saves input/output/reference/WER per row
+src/hub_sync.py                uploads a run's output_dir into its folder in
+                               the shared Hub repo (checkpoints, tb logs,
+                               config, test_eval)
+src/train.py                   single training run (LoRA SFT)
+src/run_sweep.py               runs several training configs back-to-back,
+                               then compares them (by test WER, falling back
+                               to eval loss) -- auto-continues the winner
+                               with a follow-up run
+src/supervise.py               launches/monitors one training run as a
+                               detached process, with CUDA-OOM auto-recovery
+                               -- see "Telegram agent" below
+src/tools.py                   the ~20 named operations the Telegram agent
+                               can call (process control, config,
+                               data/checkpoints, results, sweeps, GPU/disk
+                               health)
+src/notify.py                  Telegram send/receive helpers
+src/telegram_agent.py          the agent's long-polling loop (`./run.sh agent`)
+configs/data/default.yaml      data-prep config for build_from_config.py: either a
+                               prebuilt Hub dataset id, or build_dataset.py +
+                               prepare_split.py's args -- see "Data config"
+configs/train/smoke.yaml       tiny end-to-end config used by `run.sh smoke`
+configs/train/base.yaml        template/example single-run config (not
+                               currently used by sweep.yaml -- see below)
+configs/train/qwen3.5-2b.yaml, configs/train/gemma-3-1b-it.yaml
+                               standalone configs for the two models
+                               currently being fine-tuned, each sized for
+                               their own memory footprint rather than
+                               sharing base.yaml's
+configs/train/sweep.yaml       currently queues just those two models' configs
 docs/asr_dataset_builder.md
-                        column schema + example rows for build_dataset.py's
-                        output (chunked vs. assembled)
+                               column schema + example rows for
+                               build_dataset.py's output (chunked vs. assembled)
 notebooks/load_model.ipynb
-                        download one experiment's folder from the Hub and
-                        run it on a sample transcript
+                               download one experiment's folder from the Hub
+                               and run it on a sample transcript
 notebooks/explore_finetuning_data.ipynb
-                        browse build_dataset.py/prepare_split.py output by
-                        hand -- composition, entity/typo detection, word
-                        confidence, length distributions, sample/search tools
+                               browse build_dataset.py/prepare_split.py
+                               output by hand -- composition, entity/typo
+                               detection, word confidence, length
+                               distributions, sample/search tools
 ```
+
+## Data config
+
+`configs/data/default.yaml` picks, in one reviewable file, whether training
+data comes from an already-built-and-curated Hub dataset or gets (re)built
+from raw `ErfanRou/callcc-2k` -- and if the latter, holds every
+`build_dataset.py`/`prepare_split.py` flag as YAML instead of a hand-assembled
+shell command:
+
+```bash
+python src/build_from_config.py --config configs/data/default.yaml
+```
+
+- `source: prebuilt` -- `prebuilt.dataset_id` (e.g.
+  `PedramR/ASR_Post-processing-dataset`) is already built and curated.
+  `build_from_config.py` just confirms the repo is reachable and prints what to set
+  `training.dataset_id` to in a train config -- `dataset_id` already accepts
+  a Hub id directly (see `src/config.py`), so nothing gets downloaded locally.
+- `source: build` -- runs `build_dataset.py` then `prepare_split.py` back to
+  back, using the config's `build`/`build.prepare` sections as their CLI
+  flags (see each script's own docstring, and the "Build the training data"
+  section below, for what every flag does and why it defaults where it
+  does).
+
+Use `--set` for a one-off override without editing the file (same convention
+as `train.py`), e.g. `--set build.assembled_ratio=0.3`. `./run.sh build`
+already drives this (`DATA_CONFIG`/`ASSEMBLED_RATIO` env vars override it
+without touching the file); the sections below describe what it's actually
+running and every flag in detail, useful whether you go through the data
+config or call `build_dataset.py`/`prepare_split.py` directly.
 
 ## 1. Build the training data
 
@@ -227,7 +277,7 @@ used to build it).
 
 ## 2. Configure a run
 
-Edit `configs/base.yaml` (or copy it) -- it's grouped into sections purely for
+Edit `configs/train/base.yaml` (or copy it) -- it's grouped into sections purely for
 readability; `train.py` flattens them, and an unrecognized key (e.g. a typo)
 raises an error immediately rather than being silently ignored:
 
@@ -257,6 +307,11 @@ raises an error immediately rather than being silently ignored:
 - `mask_low_signal_corrections` / `mask_min_similarity` /
   `mask_max_common_freq`: opt-in feature flag to mask un-guessable
   corrections out of the loss -- see "Low-signal correction masking" below.
+- `recoverable_correction_weight`: opt-in feature flag (default `1.0`, a
+  no-op) to up-weight guessable corrections' loss contribution -- see
+  "Recoverable-correction up-weighting" below. Independent of
+  `mask_low_signal_corrections`; reuses that flag's `mask_min_similarity`/
+  `mask_max_common_freq` rather than its own thresholds.
 - `use_unsloth`: opt-in feature flag to load the model/set up LoRA via
   Unsloth instead of plain transformers + peft -- see "Unsloth" below.
 - `training.*`: epochs, batch size, learning rate, save/eval cadence, etc.
@@ -290,13 +345,13 @@ checkpoint.
 ## 3. Train
 
 ```bash
-python src/train.py --config configs/base.yaml
+python src/train.py --config configs/train/base.yaml
 ```
 
 Override individual values without editing the file with repeatable `--set`:
 
 ```bash
-python src/train.py --config configs/base.yaml \
+python src/train.py --config configs/train/base.yaml \
   --set training.learning_rate=1e-4 \
   --set lora.r=32
 ```
@@ -306,7 +361,7 @@ data-scaling ablation), also override `output_dir`/`hub.folder` so it doesn't
 collide with a full run's:
 
 ```bash
-python src/train.py --config configs/qwen3.5-2b.yaml \
+python src/train.py --config configs/train/qwen3.5-2b.yaml \
   --set train_fraction=0.1 \
   --set output_dir=./outputs/qwen3.5-2b-10pct \
   --set hub.folder=qwen3.5-2b-10pct
@@ -439,9 +494,10 @@ triggers a generation pass over that dataset: the model corrects each
 `test.input_column` value, and scored against `test.target_column`:
 
 - `test_eval/predictions.jsonl` -- one row per example: `input`, `output`,
-  `reference`, `wer`, `input_overlap_pct`, `hallucinated`. Overwritten each
-  time with the latest checkpoint's results (not one file per checkpoint).
-- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "hallucination_rate": ..., "n_examples": ...}`.
+  `reference`, `wer`, `input_overlap_pct`, `hallucinated`, `fix_rate`,
+  `preservation_rate`. Overwritten each time with the latest checkpoint's
+  results (not one file per checkpoint).
+- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "hallucination_rate": ..., "fix_rate": ..., "preservation_rate": ..., "targeted_score": ..., "fix_rate_lenient": ..., "preservation_rate_lenient": ..., "targeted_score_lenient": ..., "n_examples": ...}`.
   `wer` (via `jiwer`, corpus-level) gives partial credit for near-misses;
   `exact_match` (fraction of rows the model got byte-for-byte right) is a
   stricter complementary read, and a direct signal on over/under-correction
@@ -456,9 +512,74 @@ triggers a generation pass over that dataset: the model corrects each
   (default `50.0`). This is the model's actual generation behavior, a
   complement to `prepare_split.py`'s `--overlap-floor` (below), which instead
   filters *training* pairs before the model ever sees them.
-- all three (`wer`, `exact_match`, `hallucination_rate`) are also logged to
-  TensorBoard as `test_wer`/`test_exact_match`/`test_hallucination_rate`, so
-  you get curves over training steps, not just final numbers.
+- `fix_rate` / `preservation_rate` / `targeted_score` answer a more specific
+  question than any metric above: not "how close is the output to the
+  reference overall," but "did it fix the actual errors, and leave
+  everything else alone." Every reference word is split into two buckets by
+  aligning `text_whisper` against the reference (`jiwer`'s word-level
+  alignment, the same tool `wer` uses): words Whisper got wrong (a
+  *target*) and words Whisper already had right. `fix_rate` is the hit
+  rate on targets -- did the prediction actually correct them; think of it
+  as WER restricted to only the words that needed fixing, aggregate WER
+  dilutes this the same way it dilutes the entity/typo slices below.
+  `preservation_rate` is the hit rate on the rest -- did the prediction
+  leave already-correct words alone instead of introducing a new error (a
+  model that rewrites confidently but carelessly can have decent WER while
+  still breaking a lot of fine text; this is what catches that).
+  `targeted_score = test.fix_weight * fix_rate + (1 - test.fix_weight) *
+  preservation_rate` (default `fix_weight: 0.5`, i.e. equal weight) is one
+  combined number for quick comparison across runs/checkpoints, but
+  `fix_rate`/`preservation_rate` are always reported unweighted alongside
+  it, since a blended score alone can hide which of the two is actually
+  driving a change. A row with no target words (Whisper already had the
+  whole thing right) gets `fix_rate: null`, not `0`.
+- `fix_rate_lenient` / `preservation_rate_lenient` / `targeted_score_lenient`
+  are the same three metrics, computed after normalizing away Persian
+  dialectal variation that isn't a real correction difference -- informal
+  vs. formal word choice (`یه`/`یک`, `خب`/`خوب`, `دیگه`/`دیگر`, ...),
+  ZWNJ/می-spacing (`میکنم`/`می کنم`/`می‌کنم`), informal/formal verb endings
+  (`کنین`/`کنید`), and `را`/`رو` (`چیزو` ~ `چیز را`). Without this, the raw
+  metrics above count a merely-informal rewrite as a "fix" or a "broken"
+  word the same as a genuine correction/regression, which understates both
+  numbers. See `src/persian_normalize.py`'s module docstring for exactly
+  what's normalized and why each rule stops where it does -- it was
+  deliberately scoped down after testing the obvious broader approach
+  (`hazm`'s full informal-word normalizer) against this project's confirmed
+  entity words and finding it silently mis-"corrects" real names/brands
+  (`آنتونیا` -> `آنتونی‌ها`, `ایکیا`/IKEA -> `ایکی‌ها`, ...). One domain-specific
+  exclusion: `شبا` is skipped, since `hazm`'s dictionary maps it to `شب‌ها`
+  ("the nights") but this call-center domain overwhelmingly means Sheba/IBAN
+  (a bank account number format) instead.
+- `fix_rate_recoverable` narrows the denominator one step further: it drops
+  targets Whisper left **no recoverable signal** for -- a word it garbled
+  past recognition (`الویزی` -> `پرویزی`) or never produced at all. No model
+  can fix those except by guessing, so counting them caps `fix_rate` below
+  1.0 no matter how good the model gets, and you can't tell "weak model"
+  from "half these were impossible." Detection is `data.py`'s
+  `low_signal_word_ranges()` -- the same one `mask_low_signal_corrections`
+  uses to drop these from the *training loss*, so what training declines to
+  teach and what eval declines to score stay in sync by construction
+  (governed by the same `mask_min_similarity`/`mask_max_common_freq`, and
+  applied regardless of whether that training flag is on). Measured on 200
+  eval rows with a model that fixes everything *except* the unrecoverable
+  positions: `fix_rate` 0.944 vs `fix_rate_recoverable` 1.000 -- the ~5.6%
+  gap is exactly the impossible corrections. `unrecoverable_targets` reports
+  how many positions were dropped. Requires a training-corpus word-frequency
+  counter (`train.py` builds it and passes it in) to tell an unrecoverable
+  rare name from a merely dropped `بله`; without one -- e.g. running
+  `evaluate.py` standalone -- it reports `null` rather than silently scoring
+  against a different denominator. The eval set alone is *not* a usable
+  substitute: tested directly, it wrongly flags phrases whose words occur
+  200,000+ times in training (`دیگه کیفیه`, `مشکل خوردین`) simply because
+  they're rare within 1,368 eval rows.
+- all ten (`wer`, `exact_match`, `hallucination_rate`, `fix_rate`,
+  `preservation_rate`, `targeted_score`, the three `_lenient` variants, and
+  `fix_rate_recoverable`) are also logged to TensorBoard as `test_wer`/
+  `test_exact_match`/`test_hallucination_rate`/`test_fix_rate`/
+  `test_preservation_rate`/`test_targeted_score`/`test_fix_rate_lenient`/
+  `test_preservation_rate_lenient`/`test_targeted_score_lenient`/
+  `test_fix_rate_recoverable`, so you get curves over training steps, not
+  just final numbers.
 
 `test.repetition_penalty` (default `1.2`) and `test.no_repeat_ngram_size`
 (default `3`) guard against a real, observed failure of plain greedy
@@ -568,8 +689,25 @@ alongside the main test set at baseline/every checkpoint/final, reusing
 every other `test.*` generation setting: results land under
 `test_eval_entity/` (`test_eval_entity_baseline/` for the pre-training pass)
 and log to TensorBoard as `test_entity_wer`/`test_entity_wer_zwnj_normalized`/
-`test_entity_exact_match`/`test_entity_hallucination_rate`, tracked
-separately from the main `test_*` curves throughout training.
+`test_entity_exact_match`/`test_entity_hallucination_rate`/
+`test_entity_fix_rate`/`test_entity_preservation_rate`/
+`test_entity_targeted_score` (see "Test-set evaluation" above for what the
+last three mean), tracked separately from the main `test_*` curves
+throughout training. `test_entity_fix_rate` is the more specific read this
+slice was built for -- restricted to words Whisper actually got wrong
+*within* the entity-confirmed calls, rather than `test_entity_wer`'s whole-
+sentence average, which still dilutes a fixed entity name into however many
+other words happen to be in the same row.
+
+Pass `--entities-dir data/output-backup` to widen the slice with a second,
+independent signal: a teammate's per-call LLM (Gemini) named-entity
+extraction over the same `callcc-test-1k` transcripts (product names,
+brands, order numbers, cities, etc., not just CRM-confirmed personal names).
+This roughly quadruples the slice (268 -> ~1,010 rows) since most of those
+entity types have no CRM record to cross-reference against. It's LLM-labeled
+and not human-verified, so each row's `entity_sources` says whether a hit
+came from `"crm"`, `"gemini"`, or both -- filter to CRM-only rows if you want
+the stricter, human-data-backed subset.
 
 ### Typo/dictation-form eval slice
 
@@ -593,10 +731,51 @@ row qualifies only if it has a typo-like error and *no* entity-like error,
 so the two slices stay disjoint. Point `test.typo_dataset_id` at the output
 -- same wiring as the entity slice (`test_eval_typo/`,
 `test_typo_wer`/`test_typo_wer_zwnj_normalized`/`test_typo_exact_match`/
-`test_typo_hallucination_rate`), and both run through the same
-`run_secondary_eval()` helper in `evaluate.py`, so adding another named
-slice beyond these two doesn't mean copy-pasting a third near-identical
-eval block into `train.py`/`TestEvalCallback`.
+`test_typo_hallucination_rate`/`test_typo_fix_rate`/
+`test_typo_preservation_rate`/`test_typo_targeted_score`), and both run
+through the same `run_secondary_eval()` helper in `evaluate.py`, so adding
+another named slice beyond these two doesn't mean copy-pasting a third
+near-identical eval block into `train.py`/`TestEvalCallback`.
+`test_typo_preservation_rate` is this slice's more specific read -- since
+its rows are typo-only by construction (no entity-like error present), a
+drop here specifically means dictation-form correction is regressing, not
+just "aggregate WER went up for some reason."
+
+### Uploading the eval slices as one Hub dataset
+
+Both slices can be published as one Hub dataset repo instead of two local
+files (or two separate repos) -- useful for sharing them with the team the
+same way the training data is shared via `PedramR/ASR_Post-processing-dataset`.
+`src/build_eval_dataset.py` stacks both into one file, tagged with a
+`row_type` column (`"entity"`/`"typo"`):
+
+```bash
+python src/build_eval_dataset.py \
+    --entity-input data/entity_eval_slice.jsonl \
+    --typo-input data/typo_eval_slice.jsonl \
+    --output data/eval_dataset.jsonl
+```
+
+`test_entity_dataset_id`/`test_typo_dataset_id` can then both point at the
+*same* repo -- `test_entity_row_type: entity` / `test_typo_row_type: typo`
+tell `run_test_eval()` to filter back down to just that slice's rows after
+loading (see `config.py`), so this is functionally identical to two separate
+repos, just one to manage:
+
+```yaml
+test:
+  entity_dataset_id: PedramR/ASR_Post-processing-eval
+  typo_dataset_id: PedramR/ASR_Post-processing-eval
+  entity_row_type: entity
+  typo_row_type: typo
+```
+
+Leave `entity_row_type`/`typo_row_type` unset (the default) when
+`entity_dataset_id`/`typo_dataset_id` already point at a dedicated,
+single-slice repo or local file -- every row there already belongs to that
+slice, so no filtering is needed. Push with `datasets.Dataset.push_to_hub()`
+(or any Hub upload path) as a single `"test"` split, matching `test_split`'s
+default -- same as `test_dataset_id` already does for the main test set.
 
 ### Punctuation
 
@@ -619,7 +798,7 @@ and guessing wrong would silently train on the wrong target with no error.
 names it recognizes look inconsistent with each other:
 
 ```bash
-python src/train.py --config configs/qwen3.5-2b.yaml \
+python src/train.py --config configs/train/qwen3.5-2b.yaml \
   --set include_punctuation=true \
   --set target_column=text_soniox \
   --set test.target_column=text_raw \
@@ -647,40 +826,64 @@ guess, and training it to output a specific guess anyway just teaches it to
 guess confidently. That's a property of Whisper's failure on that word, not
 something worth reinforcing.
 
-`mask_low_signal_corrections: true` masks those spans out of the loss
+`mask_low_signal_corrections: true` masks those words out of the loss
 (`labels = -100`) at the token level, leaving everything else --
 correct passthrough text and *guessable* corrections alike -- training
-normally. "Guessable" is decided by `data.py`'s `low_signal_word_spans()`:
-for each word-level alignment error between `whisper_text` and the target,
-compute a phonetic similarity between what Whisper said and the correct
-word, normalizing well-documented Persian homophone letter groups first
-(ز/ذ/ض/ظ, س/ص/ث, ت/ط, ق/غ, ح/ه -- deliberately not ک/گ, which aren't true
-homophones) so a real homophone slip isn't penalized just for sharing few
-raw characters with the correction. A word Whisper produced *nothing* for
-at all (a "delete"-type alignment chunk) has no Whisper-side content to
-compare against, so it's always treated as unguessable regardless of
-`mask_min_similarity` -- **unless** the frequency gate below rules it out.
+normally. "Guessable" is decided by `data.py`'s `low_signal_word_ranges()`,
+per word (not per alignment chunk -- a multi-word chunk with one genuinely
+rare word used to mask its ordinary neighbors too; verified directly and
+fixed, see the function's docstring), via three independent signals, any
+one of which rescues a word from masking:
 
-Phonetic similarity alone isn't enough, though: tested directly against the
-curated training set, it flagged mostly common function/filler words
-("رو", "بله", "و", "هم", "خب"), not names -- a dropped "بله" (yes) scores
-the same 0.0 similarity as a dropped name, even though it's trivially
-predictable from Persian dialogue structure regardless of what Whisper
-produced. `low_signal_word_spans()` also takes a corpus-wide word-frequency
-count (`train.py` builds this once over every training target before
-tokenizing) and only masks a span if at least one of its words occurs at
-most `mask_max_common_freq` times in it -- a span made up entirely of common
-words is left in the loss. Verified on an 800-row sample: this cut the
-share of examples with any masking from 89% to 52% and total masked tokens
-by ~83%, and the masked spans left afterward were genuinely names
-("شاهرخی", "صفایی‌فر", "حسن‌پور") and rare content words ("مالیات",
-"مصاحبه", "سومین"), not routine dictation-error vocabulary.
+1. **Phonetic similarity** to what Whisper actually produced there, after
+   normalizing well-documented Persian homophone letter groups first
+   (ز/ذ/ض/ظ, س/ص/ث, ت/ط, ق/غ, ح/ه -- deliberately not ک/گ, which aren't true
+   homophones) so a real homophone slip isn't penalized just for sharing few
+   raw characters with the correction. A word Whisper produced *nothing* for
+   at all (a "delete"-type alignment chunk) has no Whisper-side content to
+   compare against, so it's always treated as unguessable by this signal
+   alone -- **unless** one of the next two rules it back in.
+2. **Corpus-wide frequency**: tested directly, phonetic similarity alone
+   flagged mostly common function/filler words ("رو", "بله", "و", "هم",
+   "خب"), not names -- a dropped "بله" (yes) scores the same 0.0 similarity
+   as a dropped name, even though it's trivially predictable from Persian
+   dialogue structure regardless of what Whisper produced. A word occurring
+   more than `mask_max_common_freq` times in `corpus_freq` (`train.py`
+   builds this once over every training target) is treated as guessable
+   from context and kept. This lookup also checks a ZWNJ-joined word's
+   split-apart parts, not just the joined form -- verified directly, a word
+   is sometimes only rare because of an inconsistently-applied half-space
+   ("هیچ‌جایش" occurs once joined, but "هیچ" (33,613) and "جایش" (14) are
+   both individually common split apart), and 83.3% of rare ZWNJ-joined
+   words in the training corpus flip to "common enough" once looked up this
+   way. This only changes the frequency *lookup* -- the word itself is
+   never rewritten anywhere else in the pipeline, unlike a global
+   ZWNJ-stripping pass, which would also un-join real compounds like
+   "می‌کنم" and shift alignment indices everywhere they're used.
+3. **Repetition within the same call**: whole-call assembled rows (not
+   single-segment chunked ones) can mention the same word more than once --
+   if Whisper independently produced this exact word correctly *somewhere
+   else* in this row's own `text_whisper`, that's a real in-context clue the
+   model could learn to use, not just corpus-wide commonness. Verified
+   directly: 27.7% of words masked under signals 1+2 alone also satisfy
+   this. Checked as plain membership in the row's Whisper word set (not
+   requiring that other occurrence be a confirmed-correct alignment at its
+   own position) -- measured that the stricter, alignment-based version
+   agrees with this simpler one 99.5% of the time once per-word masking
+   (the fix above) is applied, which isn't worth the extra complexity for
+   an ASR model confirmed not to hallucinate content.
+
+Verified on a 3,000-row sample (after all three signals and the per-word
+fix): 123 words masked, all genuinely rare on inspection -- surnames
+("میردامادی", "سیدنورم", "بهمنی‌نژاده"), rare content words ("لوسترهایی",
+"چندتاشونو"), not routine dictation-error vocabulary or common words
+dragged in by a rare neighbor.
 
 ```bash
-python src/train.py --config configs/qwen3.5-2b.yaml \
-  --set mask_low_signal_corrections=true \
-  --set output_dir=./outputs/qwen3.5-2b-masked
+./run.sh train qwen3.5-2b-masked
 ```
+
+(`configs/train/qwen3.5-2b-masked.yaml` -- identical to `qwen3.5-2b.yaml` except this flag and `output_dir`, kept as its own committed file rather than a `--set` override so the A/B is reproducible from source control, not a hand-typed flag.)
 
 `mask_min_similarity` (default `0.75`) controls the phonetic cutoff --
 tuned on a small hand-checked sample to cleanly separate known-guessable
@@ -701,6 +904,63 @@ thinking content). If that subsequence search fails for some row (observed
 only for a row truncated mid-target), masking is silently skipped for that
 row rather than approximated -- the row still trains normally, just without
 this extra masking.
+
+### Recoverable-correction up-weighting
+
+Complements masking rather than replacing it: masking removes the
+*unguessable* corrections (category 3) from the loss entirely; this instead
+up-weights the *guessable* ones (category 2 -- Whisper got it wrong, but one
+of masking's own three rescue signals says it's recoverable) relative to
+everything else, on the theory that they're a small minority of any given
+example's tokens -- most of the target is already-correct passthrough text,
+or with masking on, the least-recoverable corrections have been removed
+from the loss altogether -- so the gradient signal to actually fix
+mis-heard-but-guessable words can get diluted by sheer token-count
+imbalance.
+
+`recoverable_correction_weight` (default `1.0`, a no-op) multiplies the
+per-token loss for every category-2 target token. It reuses
+`mask_min_similarity`/`mask_corpus_freq`/`mask_max_common_freq` as its own
+"is this guessable" signals rather than a second set of thresholds that
+could disagree with masking's about the same word -- both features are
+built on `data.py`'s `word_correction_categories()`, the single shared
+function that decides, per word, which of the three categories
+(already-correct / recoverable-correction / unrecoverable-correction) it's
+in.
+
+Applying a non-uniform per-token weight needs a custom loss -- the model's
+built-in `labels`-based loss (`AutoModelForCausalLM`'s default) has no hook
+for it -- so `train.py`'s `WeightedLossTrainer` withholds `labels` from the
+model call and computes a weighted cross-entropy by hand instead, only ever
+used when `recoverable_correction_weight != 1.0` (a run that doesn't use
+this feature gets the plain `Trainer`, untouched). Verified directly rather
+than assumed: with every weight equal to 1.0, this custom loss is
+bit-identical to the model's own built-in loss (checked against a real
+forward/backward pass, difference `0.0`); concentrating all weight onto one
+token reduces the loss to exactly that token's own cross-entropy; scaling
+every weight by the same constant leaves the loss unchanged (a weighted
+*average*, so uniform weighting is a genuine no-op regardless of the
+constant, not an accidental global loss-scale change).
+
+```bash
+./run.sh train qwen3.5-2b-masked-weighted
+```
+
+(`configs/train/qwen3.5-2b-masked-weighted.yaml` -- builds on
+`qwen3.5-2b-masked.yaml`, additionally setting
+`recoverable_correction_weight: 3.0`, a starting point, not a tuned value.
+Run this after comparing the baseline against the masked-only run, not
+instead of that comparison -- it tells you whether weighting adds anything
+*on top of* masking, or whether masking alone already did the work. An
+isolated weighted-but-not-masked run, to separate the two effects instead of
+only seeing them stacked, doesn't need its own file --
+`./run.sh train qwen3.5-2b --set recoverable_correction_weight=3.0 --set output_dir=./outputs/qwen3.5-2b-weighted`.)
+
+Compare all three (or four) runs' `test_fix_rate_recoverable` /
+`test_targeted_score` together, watching `test_preservation_rate`
+specifically -- pushing harder on corrections risks over-correction (the
+model "fixing" text that was already right), which `preservation_rate`
+would catch and `fix_rate`/`test_wer` alone would not.
 
 ### Best checkpoint by WER
 
@@ -738,7 +998,7 @@ to use, but isn't required) -- everything else (the custom `PadCollator`,
 `TestEvalCallback`, hub sync, baseline eval, masking) is unaffected.
 
 ```bash
-python src/train.py --config configs/qwen3.5-2b.yaml --set use_unsloth=true
+python src/train.py --config configs/train/qwen3.5-2b.yaml --set use_unsloth=true
 ```
 
 Requires a CUDA GPU and the `unsloth` package (see `requirements.txt`).
@@ -763,9 +1023,9 @@ settings to be aware of, verified by reading rather than executing:
 
 ## 4. Compare multiple models/configs
 
-`configs/sweep.yaml` queues several jobs. Each job names its own `config`
+`configs/train/sweep.yaml` queues several jobs. Each job names its own `config`
 file -- a job that only needs a different `model_id` could reuse
-`configs/base.yaml` plus a one-line `overrides`, but every model actually in
+`configs/train/base.yaml` plus a one-line `overrides`, but every model actually in
 the current queue (`qwen3.5-2b`, `gemma-3-1b-it`) gets its own standalone
 config instead, since each has a different memory footprint and batch size
 tuned for it (see "Notes" for GPU sizing). Each job's `output_dir`,
@@ -775,13 +1035,13 @@ something else -- `hub.repo_id` is left alone, since every job is meant to
 share the same repo.
 
 `Qwen3-1.7B` and `gemma-4-E2B-it` aren't in the queue right now (on hold,
-not removed) -- `configs/base.yaml` still exists as the single-run template/
+not removed) -- `configs/train/base.yaml` still exists as the single-run template/
 example for `Qwen3-1.7B`, and a `gemma-4-E2B-it` config would need its own
 smaller batch size (it's ~5B params on disk, the biggest of the four
 candidates, despite the "E2B" name) before being added back.
 
 ```bash
-python src/run_sweep.py --sweep configs/sweep.yaml
+python src/run_sweep.py --sweep configs/train/sweep.yaml
 ```
 
 Jobs run one after another (they share a GPU) via `python src/train.py
@@ -792,7 +1052,7 @@ set) is printed and written to `<output_root>/summary.json`.
 
 To train just one of these configs instead of the whole queue, use
 `./run.sh train <name>` (e.g. `./run.sh train qwen3.5-2b`) or call
-`python src/train.py --config configs/qwen3.5-2b.yaml` directly. Either way,
+`python src/train.py --config configs/train/qwen3.5-2b.yaml` directly. Either way,
 `output_dir`/`hub.folder` come straight from that config file (e.g.
 `./outputs/qwen3.5-2b`) rather than being namespaced under
 `sweep.yaml`'s `output_root` the way a `run_sweep.py` run would.
