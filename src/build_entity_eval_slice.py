@@ -24,13 +24,28 @@ name signal) and must appear as a whole word in the reference (not a
 substring), to avoid false positives from common words that happen to
 contain a name as a substring.
 
+Optionally, pass --entities-dir to widen the slice beyond CRM-confirmed
+personal names using a second, independent source: a directory of per-call
+LLM (Gemini) named-entity extractions keyed by call_id (see
+data/output-backup/*.json -- span/category/subtype/confidence per entity,
+run over the same callcc-test-1k reference transcripts). Each entity's `span`
+is matched against `text` the same way CRM name-words are (whole word/phrase,
+not a substring), so a row is kept if *either* source confirms an entity.
+This is LLM-labeled, not human-verified, so treat it as a second signal
+rather than ground truth -- `entity_sources` on each row says whether a hit
+came from "crm", "gemini", or both, so you can filter to the stricter
+CRM-only rows later if needed.
+
 Example:
   python3 src/build_entity_eval_slice.py --output data/entity_eval_slice.jsonl
+  python3 src/build_entity_eval_slice.py --output data/entity_eval_slice.jsonl \
+      --entities-dir data/output-backup
 """
 import argparse
 import json
 import re
 import sys
+from pathlib import Path
 
 from huggingface_hub import HfFileSystem
 
@@ -40,7 +55,11 @@ def parse_args():
     p.add_argument("--repo-id", default="ErfanRou/callcc-test-1k")
     p.add_argument("--output", required=True, help="Path to write the entity eval slice .jsonl.")
     p.add_argument("--min-name-word-len", type=int, default=3,
-                    help="Minimum character length for a CRM name word to count as a match.")
+                    help="Minimum character length for a CRM name word, or a Gemini entity span, to count as a "
+                         "match.")
+    p.add_argument("--entities-dir", default=None,
+                    help="Optional dir of per-call Gemini entity-extraction JSON files (keyed by call_id) to "
+                         "widen the slice beyond CRM name matches. See module docstring.")
     return p.parse_args()
 
 
@@ -57,6 +76,31 @@ def persian_name_words(crm: dict, min_len: int) -> set[str]:
             if len(word) >= min_len:
                 words.add(word)
     return words
+
+
+def load_gemini_entities(entities_dir: str) -> dict[str, list[dict]]:
+    """call_id -> pooled entity dicts from a teammate's Gemini extraction backup
+    (data/output-backup/*.json), flattened across that file's `groups`."""
+    entities_by_call: dict[str, list[dict]] = {}
+    for path in Path(entities_dir).glob("*.json"):
+        d = json.loads(path.read_text(encoding="utf-8"))
+        call_id = d.get("call_id") or path.stem
+        ents = [e for g in d.get("groups", {}).values() for e in g.get("entities", [])]
+        entities_by_call[call_id] = ents
+    return entities_by_call
+
+
+def whole_span_in_text(span: str, text: str) -> bool:
+    """True if `span` (one or more words) appears in `text` bounded by
+    whitespace on both sides -- i.e. as itself, not as part of a larger word."""
+    return re.search(r"(?<!\S)" + re.escape(span) + r"(?!\S)", text) is not None
+
+
+def gemini_span_hits(text: str, entities: list[dict], min_len: int) -> list[dict]:
+    """Entities whose `span` is long enough and actually appears in `text`,
+    same match rule as persian_name_words but extended to multi-word spans."""
+    return [e for e in entities
+            if len((e.get("span") or "").strip()) >= min_len and whole_span_in_text(e["span"].strip(), text)]
 
 
 def main():
@@ -77,19 +121,25 @@ def main():
             tables.append(pq.ParquetFile(f).read(columns=cols, use_threads=True))
     rows = pa.concat_tables(tables).to_pylist()
 
+    gemini_entities_by_call = load_gemini_entities(args.entities_dir) if args.entities_dir else {}
+
     out_rows = []
     for r in rows:
-        if not r["text_whisper"] or not r["text"] or not r["crm_metadata"]:
+        if not r["text_whisper"] or not r["text"]:
             continue
-        crm = json.loads(r["crm_metadata"])
+
+        crm = json.loads(r["crm_metadata"]) if r["crm_metadata"] else {}
         name_words = persian_name_words(crm, args.min_name_word_len)
-        if not name_words:
+        crm_hits = sorted({w for w in r["text"].split() if w in name_words})
+
+        gemini_hits = gemini_span_hits(
+            r["text"], gemini_entities_by_call.get(r["call_id"], []), args.min_name_word_len)
+
+        entity_words = sorted(set(crm_hits) | {e["span"].strip() for e in gemini_hits})
+        if not entity_words:
             continue
-        ref_words = r["text"].split()
-        hit_words = sorted({w for w in ref_words if w in name_words})
-        if not hit_words:
-            continue
-        whisper_words = set(r["text_whisper"].split())
+
+        sources = [s for s, hit in (("crm", crm_hits), ("gemini", gemini_hits)) if hit]
         out_rows.append({
             "call_id": r["call_id"],
             "channel": r["channel"],
@@ -97,8 +147,12 @@ def main():
             "text": r["text"],
             # Punctuated version of `text` -- see Config.include_punctuation.
             "text_raw": r["text_raw"],
-            "entity_words": hit_words,
-            "entity_word_missing_from_whisper": any(w not in whisper_words for w in hit_words),
+            "entity_words": entity_words,
+            "entity_spans": [{"span": e["span"].strip(), "category": e.get("category"),
+                               "subtype": e.get("subtype")} for e in gemini_hits],
+            "entity_sources": sources,
+            "entity_word_missing_from_whisper": any(
+                not whole_span_in_text(w, r["text_whisper"]) for w in entity_words),
         })
 
     with open(args.output, "w", encoding="utf-8") as f:
@@ -106,8 +160,13 @@ def main():
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     n_mismatch = sum(1 for r in out_rows if r["entity_word_missing_from_whisper"])
+    n_crm_only = sum(1 for r in out_rows if r["entity_sources"] == ["crm"])
+    n_gemini_only = sum(1 for r in out_rows if r["entity_sources"] == ["gemini"])
+    n_both = sum(1 for r in out_rows if len(r["entity_sources"]) == 2)
     print(f"scanned {len(rows)} rows from {args.repo_id}", file=sys.stderr)
     print(f"wrote {len(out_rows)} rows with a confirmed entity word to {args.output}", file=sys.stderr)
+    if args.entities_dir:
+        print(f"  by source: crm-only {n_crm_only}, gemini-only {n_gemini_only}, both {n_both}", file=sys.stderr)
     print(f"{n_mismatch}/{len(out_rows)} of those have Whisper actually wrong on that word", file=sys.stderr)
 
 
