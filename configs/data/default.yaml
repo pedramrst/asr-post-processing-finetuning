@@ -1,11 +1,16 @@
-# Data-prep config for src/build_data.py -- controls where the training
-# dataset comes from. See README.md's "Data config" section.
+# Data-prep config for src/build_from_config.py -- controls where the
+# training and eval datasets come from. See README.md's "Data config"
+# section. Training configs (configs/train/*.yaml) can reference this file
+# directly via their own `data_config` field instead of hardcoding
+# dataset_id/test.entity_dataset_id/test.typo_dataset_id/row types --
+# config.py's load_config() fills those in from here as defaults (a
+# training config's own explicit values still win if it sets them). See
+# Config.data_config's docstring for exactly which fields this supplies.
 #
 # source: prebuilt
 #   Use an already-built-and-curated dataset published to a Hub dataset
-#   repo (prebuilt.dataset_id). build_data.py just confirms the repo is
-#   reachable; nothing gets built or downloaded locally -- point a train
-#   config's training.dataset_id at prebuilt.dataset_id directly.
+#   repo (prebuilt.dataset_id). build_from_config.py just confirms the repo
+#   is reachable; nothing gets built or downloaded locally.
 #
 # source: build
 #   (Re)build the dataset from raw ErfanRou/callcc-2k via build_dataset.py,
@@ -22,6 +27,14 @@ build:
   # should dominate the raw data -- see build_dataset.py's docstring.
   assembled_ratio: 0.9
   seed: 42
+  # Where build_from_config.py writes build_dataset.py's raw output and
+  # prepare_split.py's curated output -- also what a referencing training
+  # config's dataset_id resolves to for source: build (see config.py's
+  # load_config()), so the two can't disagree about where the curated
+  # dataset actually landed. Only `output` matters for that resolution;
+  # `raw_output` is here for symmetry/explicitness.
+  raw_output: ./asr_dataset.jsonl
+  output: ./asr_dataset_curated.jsonl
 
   prepare:
     wer_cap: 1.0
@@ -34,3 +47,16 @@ build:
     entity_confidence_max_freq: 3
     entity_max_repeats: 5
     seed: 42
+
+# Eval dataset -- see README's "Uploading the eval slices as one Hub
+# dataset". Unlike the training dataset above, there's no source:
+# prebuilt/build toggle here: this repo is always prebuilt (built by
+# src/build_eval_dataset.py, a separate one-off step, not something
+# build_from_config.py drives). A bare dataset_id isn't enough to use it on
+# its own, though -- entity_row_type/typo_row_type are the "arguments"
+# needed to actually select the right rows, since one repo holds both
+# slices distinguished by a `row_type` column.
+test:
+  dataset_id: PedramR/ASR_Post-processing-eval
+  entity_row_type: entity
+  typo_row_type: typo

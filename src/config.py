@@ -69,6 +69,20 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
 class Config:
     model_id: str
     dataset_id: str
+    # Optional path to a data config (see configs/data/default.yaml) --
+    # load_config() reads it and fills in dataset_id/test_entity_dataset_id/
+    # test_typo_dataset_id/test_entity_row_type/test_typo_row_type as
+    # defaults from it (see _resolve_data_config()), so those don't need to
+    # be hand-duplicated across every training config -- change the data
+    # config once and every training config referencing it picks it up.
+    # Anything this training config's own YAML sets explicitly for those
+    # fields still wins over the data config's value. Kept as a real field
+    # (not consumed and discarded) so it shows up in a run's saved
+    # config.yaml/get_effective_config -- a record of which data config
+    # actually produced these values, not just the resolved values
+    # themselves. null (the default) skips this entirely -- dataset_id must
+    # be set directly in that case, same as before this existed.
+    data_config: str | None = None
     train_split: str = "train"
     eval_split: str | None = None
     # Only used when dataset_id is a local file with no predefined splits
@@ -363,9 +377,57 @@ def _coerce(value: Any, target_type: Any) -> Any:
     return value
 
 
+def _resolve_data_config(path: str) -> dict[str, Any]:
+    """Reads a data config (see configs/data/default.yaml) and returns the
+    Config fields it can supply as defaults for Config.data_config -- only
+    what the data config actually sets, since a training config's own
+    explicit values always take precedence over these (see load_config()).
+
+    dataset_id comes from prebuilt.dataset_id (source: prebuilt) or
+    build.output (source: build) -- the same path build_from_config.py
+    writes prepare_split.py's curated output to by default, so a training
+    config referencing this and build_from_config.py building from it can't
+    disagree about where the dataset actually landed.
+
+    test_entity_dataset_id/test_typo_dataset_id/test_entity_row_type/
+    test_typo_row_type come from the data config's `test` section (see
+    configs/data/default.yaml) -- both dataset_id fields get the same repo
+    id, since that section describes one combined eval repo, not two.
+    """
+    data_raw = yaml.safe_load(Path(path).read_text()) or {}
+    resolved: dict[str, Any] = {}
+
+    source = data_raw.get("source")
+    if source == "prebuilt":
+        dataset_id = (data_raw.get("prebuilt") or {}).get("dataset_id")
+    elif source == "build":
+        dataset_id = (data_raw.get("build") or {}).get("output", "./asr_dataset_curated.jsonl")
+    else:
+        dataset_id = None
+    if dataset_id:
+        resolved["dataset_id"] = dataset_id
+
+    test_cfg = data_raw.get("test") or {}
+    if test_cfg.get("dataset_id"):
+        resolved["test_entity_dataset_id"] = test_cfg["dataset_id"]
+        resolved["test_typo_dataset_id"] = test_cfg["dataset_id"]
+    if test_cfg.get("entity_row_type"):
+        resolved["test_entity_row_type"] = test_cfg["entity_row_type"]
+    if test_cfg.get("typo_row_type"):
+        resolved["test_typo_row_type"] = test_cfg["typo_row_type"]
+    return resolved
+
+
 def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> Config:
     raw = yaml.safe_load(Path(path).read_text()) or {}
-    flat = _flatten(raw)
+    own_flat = _flatten(raw)
+
+    flat: dict[str, Any] = {}
+    data_config_path = own_flat.get("data_config")
+    if data_config_path:
+        flat.update(_resolve_data_config(data_config_path))
+    flat.update(own_flat)
+
     if overrides:
         flat.update(_flatten(overrides))
 

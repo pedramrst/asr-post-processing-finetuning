@@ -64,10 +64,16 @@ def parse_args() -> argparse.Namespace:
         "--set", dest="overrides", action="append", default=[], metavar="section.key=value",
         help="Override a single config value, e.g. --set build.assembled_ratio=0.3. Repeatable.",
     )
-    p.add_argument("--raw-output", default="./asr_dataset.jsonl",
-                    help="Where build_dataset.py writes its raw output (source: build only).")
-    p.add_argument("--output", default="./asr_dataset_curated.jsonl",
-                    help="Where prepare_split.py writes the curated output (source: build only).")
+    p.add_argument("--raw-output", default=None,
+                    help="Where build_dataset.py writes its raw output (source: build only). Defaults to the "
+                         "config's build.raw_output, or ./asr_dataset.jsonl if that's unset too.")
+    p.add_argument("--output", default=None,
+                    help="Where prepare_split.py writes the curated output (source: build only). Defaults to "
+                         "the config's build.output, or ./asr_dataset_curated.jsonl if that's unset too -- "
+                         "Config.load_config()'s data_config resolution (see config.py) assumes this same "
+                         "default for source: build, so a config that overrides build.output here should set "
+                         "it in the YAML, not just via this flag, or the two will disagree about where the "
+                         "curated dataset actually is.")
     return p.parse_args()
 
 
@@ -107,8 +113,14 @@ def run_prebuilt(cfg: dict) -> None:
     print(f"Set training.dataset_id: {dataset_id} in your train config -- no local build needed.")
 
 
-def run_build(cfg: dict, raw_output: str, curated_output: str) -> None:
+_DEFAULT_RAW_OUTPUT = "./asr_dataset.jsonl"
+_DEFAULT_OUTPUT = "./asr_dataset_curated.jsonl"
+
+
+def run_build(cfg: dict, raw_output: str | None, curated_output: str | None) -> None:
     build_cfg = cfg.get("build") or {}
+    raw_output = raw_output or build_cfg.get("raw_output", _DEFAULT_RAW_OUTPUT)
+    curated_output = curated_output or build_cfg.get("output", _DEFAULT_OUTPUT)
     prepare_cfg = build_cfg.get("prepare") or {}
     if "assembled_ratio" not in build_cfg:
         print("build.assembled_ratio is required in the data config for source: build.", file=sys.stderr)

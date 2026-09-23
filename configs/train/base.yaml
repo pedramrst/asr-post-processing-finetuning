@@ -3,12 +3,15 @@
 # dataclass, so every key here must be a real field (typos raise an error).
 
 model_id: Qwen/Qwen3-1.7B
-# Either a local path to prepare_split.py's curated .jsonl (used as-is
-# below, with eval_fraction carving out validation) -- NOT build_dataset.py's
-# raw output directly, run it through prepare_split.py first -- or a Hub
-# dataset repo id, in which case set train_split/eval_split to its named
-# splits instead and eval_fraction is ignored.
-dataset_id: ./asr_dataset_curated.jsonl
+# Supplies dataset_id -- see configs/data/default.yaml and README's "Data
+# config". Set dataset_id explicitly instead (see its own field docstring
+# in config.py) to bypass this: either a local path to prepare_split.py's
+# curated .jsonl (used as-is below, with eval_fraction carving out
+# validation) -- NOT build_dataset.py's raw output directly, run it through
+# prepare_split.py first -- or a Hub dataset repo id, in which case set
+# train_split/eval_split to its named splits instead and eval_fraction is
+# ignored.
+data_config: configs/data/default.yaml
 train_split: train
 eval_split: null
 eval_fraction: 0.1
@@ -120,14 +123,22 @@ test:
   # src/build_entity_eval_slice.py and README's "Named-entity eval slice".
   # Aggregate WER above mixes entity-heavy and entity-free calls together,
   # which hides weak named-entity correction inside a number dominated by
-  # everything else. null skips this entirely.
+  # everything else. null skips this entirely -- explicit here (rather than
+  # left unset) specifically to override data_config's own entity_dataset_id/
+  # entity_row_type defaults, since this template demonstrates the off
+  # state; other configs in this repo turn it on by leaving both unset
+  # instead. entity_row_type is inert either way once entity_dataset_id is
+  # null (run_secondary_eval() no-ops before ever looking at it), but nulling
+  # it too keeps this template's "everything off" state unambiguous.
   entity_dataset_id: null
+  entity_row_type: null
   # Same idea, for typo/dictation-form errors (stutters, word-boundary
   # merges, ZWNJ) instead of named entities -- see
   # src/build_typo_eval_slice.py. A regression guard, not an improvement
   # target: the model already handles this error category well, so the
   # point is catching if pushing harder on entities erodes it.
   typo_dataset_id: null
+  typo_row_type: null
   # Weight on fix_rate vs. preservation_rate in targeted_score -- see
   # README's "Test-set evaluation". 0.5 (equal weight) is the starting
   # point; raise it to prioritize catching more errors even at some

@@ -145,21 +145,48 @@ python src/build_from_config.py --config configs/data/default.yaml
 
 - `source: prebuilt` -- `prebuilt.dataset_id` (e.g.
   `PedramR/ASR_Post-processing-dataset`) is already built and curated.
-  `build_from_config.py` just confirms the repo is reachable and prints what to set
-  `training.dataset_id` to in a train config -- `dataset_id` already accepts
-  a Hub id directly (see `src/config.py`), so nothing gets downloaded locally.
+  `build_from_config.py` just confirms the repo is reachable and prints what
+  `training.dataset_id` resolves to -- `dataset_id` already accepts a Hub id
+  directly (see `src/config.py`), so nothing gets downloaded locally.
 - `source: build` -- runs `build_dataset.py` then `prepare_split.py` back to
   back, using the config's `build`/`build.prepare` sections as their CLI
   flags (see each script's own docstring, and the "Build the training data"
   section below, for what every flag does and why it defaults where it
-  does).
+  does). `build.raw_output`/`build.output` control where the two scripts'
+  output lands -- `build.output` doubles as what a referencing train
+  config's `dataset_id` resolves to for this mode (see below), so the two
+  can't disagree about where the curated dataset actually is.
 
-Use `--set` for a one-off override without editing the file (same convention
-as `train.py`), e.g. `--set build.assembled_ratio=0.3`. `./run.sh build`
-already drives this (`DATA_CONFIG`/`ASSEMBLED_RATIO` env vars override it
-without touching the file); the sections below describe what it's actually
-running and every flag in detail, useful whether you go through the data
-config or call `build_dataset.py`/`prepare_split.py` directly.
+A separate `test` section holds the eval dataset -- see "Uploading the eval
+slices as one Hub dataset" below. Unlike training data there's no
+prebuilt/build toggle (that repo is always prebuilt, by a one-off run of
+`build_eval_dataset.py`, not something `build_from_config.py` drives) --
+just `dataset_id` plus the `entity_row_type`/`typo_row_type` values needed
+to actually use it, since one repo holds both slices distinguished by a
+`row_type` column.
+
+### Wiring a train config to this file
+
+A train config (`configs/train/*.yaml`) can reference this file directly
+instead of hardcoding `dataset_id`/`test.entity_dataset_id`/
+`test.typo_dataset_id`/`test.entity_row_type`/`test.typo_row_type`:
+
+```yaml
+data_config: configs/data/default.yaml
+```
+
+`config.py`'s `load_config()` reads the referenced file and fills in those
+five fields as defaults -- change `configs/data/default.yaml` once (e.g.
+point `prebuilt.dataset_id` at a new dataset version) and every train config
+referencing it picks it up without being touched individually. Anything a
+train config sets explicitly for those same fields still wins over the data
+config's value (`base.yaml` does this deliberately -- see its
+`entity_dataset_id: null` comment -- to demonstrate the eval-slice-off
+state even though it references this file); `--set` overrides win over
+both. `data_config` is kept as a real, saved field (not consumed and
+discarded), so a run's `config.yaml`/`get_effective_config` shows which data
+config actually produced its resolved values, not just the values
+themselves.
 
 ## 1. Build the training data
 
@@ -285,7 +312,9 @@ raises an error immediately rather than being silently ignored:
   `dataset_id` can be a local path (like the `.jsonl` from step 1 -- in which
   case `eval_fraction` carves out a validation split, since that file has no
   predefined splits) or a Hub dataset repo id (in which case use
-  `train_split`/`eval_split` instead).
+  `train_split`/`eval_split` instead). `data_config: configs/data/default.yaml`
+  fills in `dataset_id` (and the entity/typo eval fields below) from that
+  file instead of hardcoding them -- see "Data config" above.
 - `train_fraction`: deterministically subsamples only the train split to this
   fraction of its rows (`eval`/`validation` stays full-size). `null`
   (default) or `1.0` uses every row. Meant for a data-scaling ablation --
