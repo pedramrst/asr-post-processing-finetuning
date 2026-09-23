@@ -176,7 +176,11 @@ def low_signal_word_spans(
     """Character [start, end) spans in `target_text` where correcting
     whisper_text has no recoverable signal to learn from -- see
     Config.mask_low_signal_corrections and README's "Low-signal correction
-    masking".
+    masking". Thin wrapper around low_signal_word_ranges() (see its
+    docstring for what "no recoverable signal" means and the three signals
+    that can rescue a word from it) that converts its word-index ranges to
+    character offsets, for callers that need to slice/mask `target_text`
+    directly (here, token-level loss masking via the offset mapping).
 
     Verified directly on a sample of confirmed entity corrections: roughly
     half had no recoverable signal at all -- the target word bears little
@@ -198,37 +202,30 @@ def low_signal_word_spans(
     -- like any threshold tuned on a small sample, treat it as a reasonable
     starting point to revisit with more data, not a precise cutoff.
 
-    Only "substitute" (Whisper produced a different word) and "delete"
-    (jiwer's term for the reverse of what it sounds like here: the *target*
-    has a word Whisper produced *nothing* for at all, i.e. Whisper's output
-    is missing/"deleted" it) alignment chunks are considered -- "insert"
-    (Whisper hallucinated extra content not in the target) has no target-side
-    span to flag, and "equal" needs no correction at all. A "delete" chunk
-    has no Whisper span to compare against, so its similarity is always
-    0.0 -- the most unrecoverable case by construction, always excluded
-    regardless of `min_similarity` -- UNLESS the frequency gate below rules
-    it out first.
-
     `corpus_freq` (a word -> corpus-wide occurrence count, e.g. from
     train.py's Counter over every training-target text) adds a second,
     necessary gate: verified directly against real training data, phonetic
     similarity alone flagged mostly *common function/filler words*
-    ("رو", "بله", "و", "هم", "خب"), not names -- a "delete" chunk always
-    scores 0.0 similarity by construction, so a dropped "بله" (yes) was
-    masked exactly as often as a dropped name, even though "بله" is
-    trivially predictable from Persian dialogue structure regardless of
-    what Whisper produced, unlike an arbitrary proper noun. A span is only
-    masked if at least one of its words occurs at most `max_common_freq`
-    times in `corpus_freq` -- if every word in it is common, it's treated as
-    guessable from context and left in the loss. `corpus_freq=None` (the
-    default) skips this gate entirely, e.g. for testing this function in
-    isolation without a corpus.
+    ("رو", "بله", "و", "هم", "خب"), not names -- a "delete" chunk (Whisper
+    produced nothing at all) always scores 0.0 similarity by construction,
+    so a dropped "بله" (yes) was masked exactly as often as a dropped name,
+    even though "بله" is trivially predictable from Persian dialogue
+    structure regardless of what Whisper produced, unlike an arbitrary
+    proper noun. `corpus_freq=None` (the default) skips this gate entirely,
+    e.g. for testing this function in isolation without a corpus.
     """
-    target_words = target_text.split()
-    whisper_words = whisper_text.split()
-    if not target_words:
+    ranges = low_signal_word_ranges(whisper_text, target_text, min_similarity, corpus_freq, max_common_freq)
+    return _word_ranges_to_char_spans(target_text, ranges)
+
+
+def _word_ranges_to_char_spans(target_text: str, ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Converts inclusive [first, last] *word*-index ranges (as returned by
+    low_signal_word_ranges()/recoverable_correction_word_ranges()) to
+    character [start, end) spans in `target_text`, for callers that need to
+    slice/mask/tag the text directly."""
+    if not ranges:
         return []
-    alignment = jiwer.process_words([target_text], [whisper_text]).alignments[0]
+    target_words = target_text.split()
 
     # Character start offset of each target word, in order -- target_text is
     # built from " ".join(...) upstream (build_dataset.py), so words are
@@ -240,23 +237,160 @@ def low_signal_word_spans(
         word_starts.append(idx)
         pos = idx + len(w)
 
-    spans = []
+    return [(word_starts[first], word_starts[last] + len(target_words[last])) for first, last in ranges]
+
+
+def _is_common_enough(word: str, corpus_freq: Counter, max_common_freq: int) -> bool:
+    """True if `word` -- or, when it's ZWNJ-joined, every one of its
+    ZWNJ-split parts -- occurs more than `max_common_freq` times in
+    `corpus_freq`.
+
+    Handles words that are only rare because of an inconsistently-applied
+    half-space, not because they're actually uncommon: verified directly,
+    "هیچ‌جایش" (joined) occurs once in the training corpus, but its parts
+    split apart -- "هیچ" (33,613) and "جایش" (14) -- are both individually
+    well above the gate. Checked across every rare (<= max_common_freq)
+    ZWNJ-joined word in the corpus: 83.3% flip to "common enough" once
+    looked up this way. This only affects the *lookup* used for this
+    recoverability decision -- the word itself isn't rewritten anywhere
+    else in the pipeline (tokenization, alignment, WER all stay untouched),
+    so this doesn't carry the risk a global ZWNJ-stripping pass would (that
+    would also un-join real compounds like "می‌کنم", changing word counts
+    and alignment indices everywhere they're used)."""
+    if corpus_freq.get(word, 0) > max_common_freq:
+        return True
+    if "‌" in word:
+        parts = word.split("‌")
+        if all(corpus_freq.get(p, 0) > max_common_freq for p in parts):
+            return True
+    return False
+
+
+def low_signal_word_ranges(
+    whisper_text: str,
+    target_text: str,
+    min_similarity: float = 0.75,
+    corpus_freq: Counter | None = None,
+    max_common_freq: int = 1,
+) -> list[tuple[int, int]]:
+    """Inclusive [first, last] *word*-index ranges in `target_text` with no
+    recoverable correction signal -- the shared core of
+    low_signal_word_spans() (which converts these to character spans for
+    token masking) and evaluate.py's fix_rate_recoverable (which drops these
+    positions from the denominator, so it measures corrections the model
+    could actually have made rather than counting impossible ones as
+    failures). See low_signal_word_spans' docstring for what "no recoverable
+    signal" means and why each gate is there.
+
+    Decided per WORD, not per jiwer alignment chunk: a multi-word
+    substitute/delete chunk used to be masked (or not) as one atomic unit,
+    which meant a single genuinely-rare word could drag ordinary neighbors
+    down with it -- verified directly on real data: the 3-word span
+    "هیچ‌جایش جزییات سفارشتون" was masked entirely because "هیچ‌جایش" (freq
+    1) failed the gate, even though "جزییات" (2,121) and "سفارشتون" (8,604)
+    are both individually common and easily guessable on their own. Each
+    reference word in a chunk is now judged independently, so every range
+    returned here is always a single word ((i, i)), never a merged span --
+    functionally equivalent for the two callers above (both just need to
+    know which character/token positions to exclude), so this doesn't
+    change their behavior beyond making the exclusions more precise.
+
+    A word is rescued from masking (kept in the loss / scored) by any ONE
+    of three independent signals:
+      1. Phonetically similar enough to what Whisper actually produced at
+         this position (checked against the whole chunk's Whisper span,
+         since jiwer doesn't give a finer sub-alignment within one chunk).
+      2. Common enough to be guessable from context regardless of what
+         Whisper said -- see _is_common_enough().
+      3. Also appears elsewhere in THIS row's own Whisper output --
+         Whisper independently produced the same word correctly somewhere
+         else in the same call (only possible for assembled/whole-call
+         rows, not single-segment chunked ones), which is a real in-context
+         clue the model can learn to use, not just corpus-wide commonness.
+         Verified directly: 27.7% of words masked under signals 1+2 alone
+         also satisfy this. Checked as plain membership in the row's
+         Whisper word set, not requiring that other occurrence to be a
+         confirmed-correct jiwer alignment at its own position -- measured
+         directly that the stricter, alignment-based version agrees with
+         this simpler one 99.5% of the time (207/208) once this function's
+         per-word decision (the change above) is applied, so the extra
+         complexity of tracking per-occurrence alignments isn't worth it
+         for an ASR model that's confirmed not to hallucinate content.
+    """
+    categories = word_correction_categories(whisper_text, target_text, min_similarity, corpus_freq, max_common_freq)
+    return [(i, i) for i, c in enumerate(categories) if c == 3]
+
+
+def word_correction_categories(
+    whisper_text: str,
+    target_text: str,
+    min_similarity: float = 0.75,
+    corpus_freq: Counter | None = None,
+    max_common_freq: int = 1,
+) -> list[int]:
+    """Per-target-word category, one entry per `target_text.split()` word:
+
+      1 -- Whisper already had this right; no correction needed.
+      2 -- Whisper got this wrong, but recoverable (any one of
+           low_signal_word_ranges' three rescue signals applies) -- a
+           genuine correction with real signal to learn from.
+      3 -- Whisper got this wrong and it's NOT recoverable -- exactly the
+           word positions low_signal_word_ranges() returns.
+
+    Shared core of low_signal_word_ranges() (uses category 3, for
+    Config.mask_low_signal_corrections/fix_rate_recoverable) and
+    Config.recoverable_correction_weight (uses category 2, up-weighted in
+    the training loss) -- computed together in one function so the two
+    features can't silently disagree about which word is which category
+    from drifting, separately-maintained implementations.
+    """
+    target_words = target_text.split()
+    whisper_words = whisper_text.split()
+    if not target_words:
+        return []
+    whisper_word_set = set(whisper_words)
+    alignment = jiwer.process_words([target_text], [whisper_text]).alignments[0]
+
+    categories = [1] * len(target_words)
     for chunk in alignment:
         if chunk.type not in ("substitute", "delete"):
-            continue
+            continue  # "equal" stays category 1; "insert" has no target-side word
         ref_span_words = target_words[chunk.ref_start_idx : chunk.ref_end_idx]
         hyp_span = " ".join(whisper_words[chunk.hyp_start_idx:chunk.hyp_end_idx])
-        ref_span = " ".join(ref_span_words)
-        if _phonetic_similarity(ref_span, hyp_span) >= min_similarity:
-            continue  # guessable enough from what Whisper actually said -- keep in the loss
-        if corpus_freq is not None and all(
-            corpus_freq.get(w, 0) > max_common_freq for w in ref_span_words
-        ):
-            continue  # every word here is common enough to be guessable from context alone
-        start = word_starts[chunk.ref_start_idx]
-        end = word_starts[chunk.ref_end_idx - 1] + len(target_words[chunk.ref_end_idx - 1])
-        spans.append((start, end))
-    return spans
+        for offset, w in enumerate(ref_span_words):
+            idx = chunk.ref_start_idx + offset
+            if _phonetic_similarity(w, hyp_span) >= min_similarity:
+                categories[idx] = 2  # guessable from what Whisper actually said here
+            elif corpus_freq is not None and _is_common_enough(w, corpus_freq, max_common_freq):
+                categories[idx] = 2  # common enough to be guessable from context alone
+            elif w in whisper_word_set:
+                categories[idx] = 2  # Whisper independently got this right elsewhere in this call
+            else:
+                categories[idx] = 3  # unrecoverable
+    return categories
+
+
+def recoverable_correction_word_ranges(
+    whisper_text: str,
+    target_text: str,
+    min_similarity: float = 0.75,
+    corpus_freq: Counter | None = None,
+    max_common_freq: int = 1,
+) -> list[tuple[int, int]]:
+    """Inclusive [first, last] *word*-index ranges in `target_text` that are
+    genuine, recoverable corrections -- category 2 of
+    word_correction_categories() (see its docstring). Counterpart to
+    low_signal_word_ranges() (category 3): together the two partition every
+    substitute/delete word into "worth training on as-is" (this one) vs.
+    "worth excluding from the loss" (that one); every "equal" word (Whisper
+    already had it right) is in neither.
+
+    Feeds Config.recoverable_correction_weight -- see
+    _weight_recoverable_correction_spans() -- to up-weight these positions
+    in the training loss, on the theory that they're diluted by far more
+    already-correct passthrough tokens in the same example."""
+    categories = word_correction_categories(whisper_text, target_text, min_similarity, corpus_freq, max_common_freq)
+    return [(i, i) for i, c in enumerate(categories) if c == 2]
 
 
 def _find_subsequence(haystack: list[int], needle: list[int]) -> int:
@@ -273,10 +407,46 @@ def _find_subsequence(haystack: list[int], needle: list[int]) -> int:
     return -1
 
 
+def _locate_target_tokens(
+    tokenizer: PreTrainedTokenizerBase,
+    target_text: str,
+    input_ids: list[int],
+    prompt_len: int,
+) -> tuple[list[tuple[int, int]], int] | None:
+    """Tokenizes `target_text` standalone and locates its token ids as a
+    contiguous subsequence within `input_ids[prompt_len:]` -- NOT assumed to
+    start exactly at `prompt_len`, since some chat templates insert
+    boilerplate between the prompt and the actual assistant content (e.g.
+    Qwen3's chat template adds an empty "<think>\\n\\n</think>\\n\\n" block
+    there even when the message itself has no such content). Shared prep
+    step for _mask_low_signal_spans()/_weight_recoverable_correction_spans()
+    -- both need to map `target_text`-relative character spans to token
+    positions in the same tokenized example.
+
+    `input_ids` must be the example's actual, unmodified token ids (e.g.
+    `kept_ids`, NOT `labels`) -- searching within `labels` would break if
+    another low-signal pass already ran first and wrote -100 into part of
+    the region being searched, since -100 is never a real token id and the
+    subsequence would no longer match.
+
+    Returns (target_offsets, start) -- `target_offsets[i]`'s corresponding
+    position in `input_ids` is `start + i` -- or None if the subsequence
+    isn't found at all, e.g. a row truncated mid-target (callers should
+    treat that as "nothing to mask/weight", not an error).
+    """
+    target_enc = tokenizer(target_text, add_special_tokens=False, return_offsets_mapping=True)
+    target_ids = target_enc["input_ids"]
+    offset = _find_subsequence(input_ids[prompt_len:], target_ids)
+    if offset == -1:
+        return None
+    return target_enc["offset_mapping"], prompt_len + offset
+
+
 def _mask_low_signal_spans(
     tokenizer: PreTrainedTokenizerBase,
     target_text: str,
     whisper_text: str,
+    input_ids: list[int],
     labels: list[int],
     prompt_len: int,
     min_similarity: float,
@@ -291,15 +461,9 @@ def _mask_low_signal_spans(
     the model to learn to do).
 
     Maps low_signal_word_spans' character spans (computed over target_text)
-    to token positions via the tokenizer's offset mapping, tokenizing
-    target_text standalone and locating those token ids as a contiguous
-    subsequence within `labels[prompt_len:]` -- NOT assumed to start exactly
-    at prompt_len, since some chat templates insert boilerplate between the
-    prompt and the actual assistant content (e.g. Qwen3's chat template adds
-    an empty "<think>\\n\\n</think>\\n\\n" block there even when the message
-    itself has no such content). Falls back to no masking (safe/
-    conservative) if the subsequence isn't found at all, e.g. a row
-    truncated mid-target.
+    to token positions via _locate_target_tokens() (see its docstring).
+    Falls back to no masking (safe/conservative) if the target's tokens
+    aren't found in `input_ids` at all, e.g. a row truncated mid-target.
 
     Returns the number of tokens masked this way.
     """
@@ -307,14 +471,10 @@ def _mask_low_signal_spans(
     if not spans:
         return 0
 
-    target_enc = tokenizer(target_text, add_special_tokens=False, return_offsets_mapping=True)
-    target_ids = target_enc["input_ids"]
-    target_offsets = target_enc["offset_mapping"]
-
-    offset = _find_subsequence(labels[prompt_len:], target_ids)
-    if offset == -1:
+    located = _locate_target_tokens(tokenizer, target_text, input_ids, prompt_len)
+    if located is None:
         return 0
-    start = prompt_len + offset
+    target_offsets, start = located
 
     masked = 0
     for i, (char_start, char_end) in enumerate(target_offsets):
@@ -324,6 +484,54 @@ def _mask_low_signal_spans(
             labels[start + i] = -100
             masked += 1
     return masked
+
+
+def _weight_recoverable_correction_spans(
+    tokenizer: PreTrainedTokenizerBase,
+    target_text: str,
+    whisper_text: str,
+    input_ids: list[int],
+    token_weights: list[float],
+    prompt_len: int,
+    min_similarity: float,
+    corpus_freq: Counter | None,
+    max_common_freq: int,
+    weight: float,
+) -> int:
+    """Sets token_weights[i] = `weight` for target tokens that fall inside a
+    genuine, recoverable correction (see recoverable_correction_word_ranges)
+    -- up-weights the loss on words Whisper got wrong but that have real
+    signal to learn from, on the theory that they're a small minority of
+    tokens in any given example (most of the target is already-correct
+    passthrough text) and so contribute little to the gradient relative to
+    how much we actually want the model to learn from them.
+
+    Same token-location mechanism as _mask_low_signal_spans() (see
+    _locate_target_tokens()) -- category 2 and category 3
+    (word_correction_categories()) are disjoint by construction, so a token
+    weighted here is never also one _mask_low_signal_spans() masks, and vice
+    versa.
+
+    Returns the number of tokens weighted this way.
+    """
+    ranges = recoverable_correction_word_ranges(whisper_text, target_text, min_similarity, corpus_freq, max_common_freq)
+    spans = _word_ranges_to_char_spans(target_text, ranges)
+    if not spans:
+        return 0
+
+    located = _locate_target_tokens(tokenizer, target_text, input_ids, prompt_len)
+    if located is None:
+        return 0
+    target_offsets, start = located
+
+    weighted = 0
+    for i, (char_start, char_end) in enumerate(target_offsets):
+        if char_start == char_end:
+            continue
+        if any(char_start < span_end and char_end > span_start for span_start, span_end in spans):
+            token_weights[start + i] = weight
+            weighted += 1
+    return weighted
 
 
 def build_example(
@@ -337,6 +545,7 @@ def build_example(
     mask_min_similarity: float = 0.75,
     mask_corpus_freq: Counter | None = None,
     mask_max_common_freq: int = 1,
+    recoverable_correction_weight: float = 1.0,
 ) -> dict:
     """Tokenize one (whisper_text -> target_text) pair with loss masked to the target span.
 
@@ -346,12 +555,14 @@ def build_example(
     templates define the `{% generation %}` block that feature needs, so it
     silently returns an all-zero mask (no error) instead of failing loudly.
 
-    Returns a dict with input_ids/attention_mask/labels plus a `status` key
-    ("ok", "truncated", or "dropped") -- callers should filter out "dropped"
-    rows (train.py does this after `.map()`; every row must return the same
-    schema during the map itself, so a dropped row still gets placeholder
-    tensor fields) -- and a `masked_low_signal_tokens` count (always 0 unless
-    `mask_low_signal_corrections` is set).
+    Returns a dict with input_ids/attention_mask/labels/token_weights plus a
+    `status` key ("ok", "truncated", or "dropped") -- callers should filter
+    out "dropped" rows (train.py does this after `.map()`; every row must
+    return the same schema during the map itself, so a dropped row still
+    gets placeholder tensor fields) -- a `masked_low_signal_tokens` count
+    (always 0 unless `mask_low_signal_corrections` is set), and a
+    `weighted_recoverable_tokens` count (always 0 unless
+    `recoverable_correction_weight != 1.0`).
 
     `on_long_example` controls what happens when the full prompt+target
     exceeds `max_length`:
@@ -374,6 +585,20 @@ def build_example(
     low_signal_word_spans() as its frequency gate -- without it, phonetic
     similarity alone flags mostly common function/filler words, not names
     (see that function's docstring).
+
+    `recoverable_correction_weight`, if not 1.0, multiplies the per-token
+    loss (see train.py's WeightedLossTrainer) for target tokens inside a
+    genuine, recoverable correction -- see
+    recoverable_correction_word_ranges()/Config.recoverable_correction_weight
+    -- on the theory that they're a small minority of any example's tokens
+    (most of the target is already-correct passthrough text or, with
+    masking on, excluded entirely) and so get diluted in the gradient
+    relative to how much we actually want the model to learn from them.
+    Reuses `mask_corpus_freq`/`mask_min_similarity`/`mask_max_common_freq` as
+    its own signals too -- both features are answering "is this word
+    guessable," just keeping opposite halves of the same answer (see
+    word_correction_categories()), so they share one set of thresholds
+    rather than risking two configs disagreeing about the same word.
     """
     if on_long_example not in ("drop", "truncate"):
         raise ValueError(f"on_long_example must be 'drop' or 'truncate', got {on_long_example!r}")
@@ -411,40 +636,66 @@ def build_example(
     labels = list(kept_ids)
     mask_len = min(len(prompt_ids), len(kept_ids))
     labels[:mask_len] = [-100] * mask_len
+    token_weights = [1.0] * len(kept_ids)
 
     masked_low_signal_tokens = 0
     if mask_low_signal_corrections and status != "dropped":
         masked_low_signal_tokens = _mask_low_signal_spans(
-            tokenizer, target_text, whisper_text, labels, len(prompt_ids), mask_min_similarity,
+            tokenizer, target_text, whisper_text, kept_ids, labels, len(prompt_ids), mask_min_similarity,
             mask_corpus_freq, mask_max_common_freq,
+        )
+
+    weighted_recoverable_tokens = 0
+    if recoverable_correction_weight != 1.0 and status != "dropped":
+        weighted_recoverable_tokens = _weight_recoverable_correction_spans(
+            tokenizer, target_text, whisper_text, kept_ids, token_weights, len(prompt_ids), mask_min_similarity,
+            mask_corpus_freq, mask_max_common_freq, recoverable_correction_weight,
         )
 
     return {
         "input_ids": kept_ids,
         "attention_mask": [1] * len(kept_ids),
         "labels": labels,
+        "token_weights": token_weights,
         "status": status,
         "masked_low_signal_tokens": masked_low_signal_tokens,
+        "weighted_recoverable_tokens": weighted_recoverable_tokens,
     }
 
 
 @dataclass
 class PadCollator:
-    """Pads input_ids/attention_mask/labels to the longest sequence in the batch."""
+    """Pads input_ids/attention_mask/labels(/token_weights) to the longest
+    sequence in the batch.
+
+    `include_token_weights` defaults off -- matching Config.
+    recoverable_correction_weight's own default of 1.0 (a no-op) -- so a run
+    that doesn't use that feature gets a batch dict with exactly the same
+    keys as before it existed, and train.py can keep using the plain
+    `Trainer` (not `WeightedLossTrainer`) for it, untouched by any of this."""
 
     pad_token_id: int
     label_pad_id: int = -100
+    include_token_weights: bool = False
 
     def __call__(self, features: list[dict]) -> dict:
         max_len = max(len(f["input_ids"]) for f in features)
-        input_ids, attention_mask, labels = [], [], []
+        input_ids, attention_mask, labels, token_weights = [], [], [], []
         for f in features:
             pad_len = max_len - len(f["input_ids"])
             input_ids.append(f["input_ids"] + [self.pad_token_id] * pad_len)
             attention_mask.append(f["attention_mask"] + [0] * pad_len)
             labels.append(f["labels"] + [self.label_pad_id] * pad_len)
-        return {
+            if self.include_token_weights:
+                # Padding value is irrelevant -- WeightedLossTrainer only
+                # ever applies weights to positions with a real label
+                # (!= -100), and padding is always labeled -100 above.
+                token_weights.append(f["token_weights"] + [1.0] * pad_len)
+        batch = {
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+        if self.include_token_weights:
+            batch["token_weights"] = torch.tensor(token_weights, dtype=torch.float32)
+        return batch
