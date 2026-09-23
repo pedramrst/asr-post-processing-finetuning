@@ -7,11 +7,11 @@ transcript). This script only handles tokenization, LoRA setup, and training —
 see data.py:load_sft_dataset for the (thin) loading step to swap in your
 teammate's actual loading/post-processing call.
 
-All hyperparameters live in a YAML config (see configs/base.yaml) rather than
+All hyperparameters live in a YAML config (see configs/train/base.yaml) rather than
 CLI flags, so a run is fully reproducible from one file. Use --set for quick
 one-off overrides without editing the file, e.g.:
 
-    python train.py --config configs/base.yaml --set training.learning_rate=1e-4 --set lora.r=32
+    python train.py --config configs/train/base.yaml --set training.learning_rate=1e-4 --set lora.r=32
 
 To queue up several runs back-to-back for comparison, use run_sweep.py instead
 of calling this script directly.
@@ -41,7 +41,7 @@ load_dotenv()
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True, help="Path to a YAML config file (see configs/base.yaml).")
+    p.add_argument("--config", required=True, help="Path to a YAML config file (see configs/train/base.yaml).")
     p.add_argument(
         "--set",
         dest="overrides",
@@ -128,6 +128,65 @@ def resolve_resume_checkpoint(cfg: Config) -> bool | str | None:
         local_dir=str(Path(cfg.output_dir).parent),
     )
     return True
+
+
+class WeightedLossTrainer(Trainer):
+    """Trainer subclass that multiplies each target token's loss by a
+    per-token weight (batch key "token_weights", built by
+    data.py's build_example()/PadCollator from Config.
+    recoverable_correction_weight) instead of the model's default uniform
+    cross-entropy.
+
+    Only ever constructed when that weight isn't 1.0 (see main(), below) --
+    a run that doesn't use this feature gets the plain `Trainer` untouched,
+    so this class existing changes nothing about the already-working default
+    path.
+
+    Recomputes the causal-LM shift-and-cross-entropy by hand instead of
+    letting the model compute its own loss from `labels`:
+    AutoModelForCausalLM's built-in loss has no hook for per-token weights,
+    so `labels` is withheld from the model call (labels=None -> it returns
+    logits only, skipping its own loss computation) and the loss is computed
+    here instead. With every weight equal to 1.0, this reduces to exactly
+    the model's own default loss (a plain mean over non--100 positions) --
+    verified directly against the built-in loss on a real batch.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # This class computes its own loss without num_items_in_batch --
+        # HF's own guidance (see Trainer.compute_loss's docstring) is to set
+        # this False in that case, or gradient-accumulation loss scaling can
+        # be slightly inaccurate.
+        self.model_accepts_loss_kwargs = False
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.pop("labels")
+        token_weights = inputs.pop("token_weights")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        # Standard causal-LM shift: token i's logits predict token i+1.
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        shift_weights = token_weights[..., 1:].contiguous()
+
+        per_token_loss = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            reduction="none",
+            ignore_index=-100,
+        )
+        # Zero out weights at ignored (-100) positions explicitly -- their
+        # loss is already 0 from ignore_index above, but a nonzero weight
+        # there would still inflate the weighted-average denominator below.
+        flat_weights = shift_weights.view(-1).to(per_token_loss.dtype) * (shift_labels.view(-1) != -100).to(
+            per_token_loss.dtype
+        )
+        total_weight = flat_weights.sum().clamp(min=1e-8)
+        loss = (per_token_loss * flat_weights).sum() / total_weight
+
+        return (loss, outputs) if return_outputs else loss
 
 
 def main() -> None:
@@ -330,13 +389,32 @@ def main() -> None:
     length_stats = Counter()
     masked_low_signal_tokens_total = 0
     masked_low_signal_examples = 0
+    weighted_recoverable_tokens_total = 0
+    weighted_recoverable_examples = 0
     system_prompt = resolve_system_prompt(cfg)
 
-    mask_corpus_freq = None
-    if cfg.mask_low_signal_corrections:
-        mask_corpus_freq = Counter()
-        for text in raw["train"][cfg.target_column]:
-            mask_corpus_freq.update(text.split())
+    # Word frequencies over the training targets. Used by three separate
+    # features, so it's built unconditionally (one pass over text already in
+    # memory): mask_low_signal_corrections and recoverable_correction_weight
+    # both feed it to word_correction_categories() to decide, per word,
+    # whether a Whisper error is a genuine recoverable correction (weighted
+    # up) or unrecoverable (masked from the *training loss*, only when
+    # enabled) -- and evaluate.py's fix_rate_recoverable drops the same
+    # unrecoverable corrections from its *eval* denominator (always -- it's
+    # the only frequency source that makes that metric comparable across
+    # runs, since the eval set alone is too small to tell a rare name from a
+    # merely eval-rare common word).
+    corpus_freq = Counter()
+    for text in raw["train"][cfg.target_column]:
+        corpus_freq.update(text.split())
+    # Only passed to build_example when at least one of the two features
+    # that use it is active -- both rely on word_correction_categories()'s
+    # corpus-frequency gate to draw the same category-2/3 line
+    # low_signal_word_ranges() itself uses, so a run using ONLY
+    # recoverable_correction_weight (masking off) still needs this, not just
+    # a run using mask_low_signal_corrections.
+    uses_word_categories = cfg.mask_low_signal_corrections or cfg.recoverable_correction_weight != 1.0
+    word_category_corpus_freq = corpus_freq if uses_word_categories else None
 
     def _map(example):
         result = build_example(
@@ -348,14 +426,19 @@ def main() -> None:
             system_prompt=system_prompt,
             mask_low_signal_corrections=cfg.mask_low_signal_corrections,
             mask_min_similarity=cfg.mask_min_similarity,
-            mask_corpus_freq=mask_corpus_freq,
+            mask_corpus_freq=word_category_corpus_freq,
             mask_max_common_freq=cfg.mask_max_common_freq,
+            recoverable_correction_weight=cfg.recoverable_correction_weight,
         )
         length_stats[result["status"]] += 1
         nonlocal masked_low_signal_tokens_total, masked_low_signal_examples
+        nonlocal weighted_recoverable_tokens_total, weighted_recoverable_examples
         if result["masked_low_signal_tokens"]:
             masked_low_signal_tokens_total += result["masked_low_signal_tokens"]
             masked_low_signal_examples += 1
+        if result["weighted_recoverable_tokens"]:
+            weighted_recoverable_tokens_total += result["weighted_recoverable_tokens"]
+            weighted_recoverable_examples += 1
         return result
 
     tokenized = raw.map(_map, remove_columns=raw["train"].column_names)
@@ -373,11 +456,22 @@ def main() -> None:
             f"{masked_low_signal_tokens_total} target tokens masked out of loss across "
             f"{masked_low_signal_examples} examples"
         )
+    if cfg.recoverable_correction_weight != 1.0:
+        print(
+            f"Recoverable-correction up-weighting (weight={cfg.recoverable_correction_weight}): "
+            f"{weighted_recoverable_tokens_total} target tokens up-weighted across "
+            f"{weighted_recoverable_examples} examples"
+        )
     if length_stats["dropped"]:
         tokenized = tokenized.filter(lambda ex: ex["status"] != "dropped")
-    tokenized = tokenized.remove_columns(["status", "masked_low_signal_tokens"])
+    tokenized = tokenized.remove_columns(["status", "masked_low_signal_tokens", "weighted_recoverable_tokens"])
+    if cfg.recoverable_correction_weight == 1.0:
+        tokenized = tokenized.remove_columns(["token_weights"])
 
-    collator = PadCollator(pad_token_id=tokenizer.pad_token_id)
+    collator = PadCollator(
+        pad_token_id=tokenizer.pad_token_id,
+        include_token_weights=cfg.recoverable_correction_weight != 1.0,
+    )
 
     has_eval = "validation" in tokenized
     training_args = TrainingArguments(
@@ -423,7 +517,7 @@ def main() -> None:
     callbacks = []
     test_eval_callback = None
     if cfg.test_dataset_id:
-        test_eval_callback = TestEvalCallback(cfg, model, tokenizer)
+        test_eval_callback = TestEvalCallback(cfg, model, tokenizer, corpus_freq)
         callbacks.append(test_eval_callback)
     if cfg.push_to_hub:
         # Registered after the test-eval callback: callbacks fire in list
@@ -431,7 +525,11 @@ def main() -> None:
         # on disk by the time this uploads output_dir.
         callbacks.append(SyncToHubCallback(cfg))
 
-    trainer = Trainer(
+    # WeightedLossTrainer only when actually needed -- see its docstring --
+    # so the default (weight 1.0 everywhere) path is the plain `Trainer`,
+    # unchanged by this feature existing.
+    trainer_cls = WeightedLossTrainer if cfg.recoverable_correction_weight != 1.0 else Trainer
+    trainer = trainer_cls(
         model=model,
         args=training_args,
         train_dataset=tokenized["train"],
@@ -466,22 +564,34 @@ def main() -> None:
             hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
             repetition_penalty=cfg.test_repetition_penalty,
             no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
+            fix_weight=cfg.test_fix_weight,
+            low_signal_corpus_freq=corpus_freq,
+            low_signal_min_similarity=cfg.mask_min_similarity,
+            low_signal_max_common_freq=cfg.mask_max_common_freq,
         )
         print(f"Baseline: wer={baseline_metrics['wer']}, exact_match={baseline_metrics['exact_match']}, "
-              f"hallucination_rate={baseline_metrics['hallucination_rate']}")
+              f"hallucination_rate={baseline_metrics['hallucination_rate']}, "
+              f"fix_rate={baseline_metrics['fix_rate']}, preservation_rate={baseline_metrics['preservation_rate']}")
         if baseline_metrics["wer"] is not None:
             trainer.log({
                 "test_wer": baseline_metrics["wer"],
                 "test_wer_zwnj_normalized": baseline_metrics["wer_zwnj_normalized"],
                 "test_exact_match": baseline_metrics["exact_match"],
                 "test_hallucination_rate": baseline_metrics["hallucination_rate"],
+                "test_fix_rate": baseline_metrics["fix_rate"],
+                "test_preservation_rate": baseline_metrics["preservation_rate"],
+                "test_targeted_score": baseline_metrics["targeted_score"],
+                "test_fix_rate_lenient": baseline_metrics["fix_rate_lenient"],
+                "test_preservation_rate_lenient": baseline_metrics["preservation_rate_lenient"],
+                "test_targeted_score_lenient": baseline_metrics["targeted_score_lenient"],
             })
 
         for name, ds_id, subdir in [
             ("entity", cfg.test_entity_dataset_id, "test_eval_entity_baseline"),
             ("typo", cfg.test_typo_dataset_id, "test_eval_typo_baseline"),
         ]:
-            secondary_metrics = run_secondary_eval(model, tokenizer, cfg, ds_id, name, subdir, trainer)
+            secondary_metrics = run_secondary_eval(
+                model, tokenizer, cfg, ds_id, name, subdir, trainer, corpus_freq)
             if secondary_metrics is not None:
                 print(f"Baseline ({name} slice): wer={secondary_metrics['wer']}, "
                       f"exact_match={secondary_metrics['exact_match']}")
@@ -509,6 +619,10 @@ def main() -> None:
             hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
             repetition_penalty=cfg.test_repetition_penalty,
             no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
+            fix_weight=cfg.test_fix_weight,
+            low_signal_corpus_freq=corpus_freq,
+            low_signal_min_similarity=cfg.mask_min_similarity,
+            low_signal_max_common_freq=cfg.mask_max_common_freq,
         )
         # source_dir == output_dir here (the just-saved final adapter/tokenizer
         # files, not a numbered checkpoint) -- update_best_checkpoint's ignore
@@ -516,8 +630,10 @@ def main() -> None:
         # subdirectory of itself.
         update_best_checkpoint(cfg.output_dir, cfg.output_dir, final_metrics, trainer.state.global_step)
 
-        run_secondary_eval(model, tokenizer, cfg, cfg.test_entity_dataset_id, "entity", "test_eval_entity")
-        run_secondary_eval(model, tokenizer, cfg, cfg.test_typo_dataset_id, "typo", "test_eval_typo")
+        run_secondary_eval(model, tokenizer, cfg, cfg.test_entity_dataset_id, "entity",
+                            "test_eval_entity", None, corpus_freq)
+        run_secondary_eval(model, tokenizer, cfg, cfg.test_typo_dataset_id, "typo",
+                            "test_eval_typo", None, corpus_freq)
     if cfg.push_to_hub:
         sync_output_dir(cfg, commit_message="final")
 

@@ -1,0 +1,117 @@
+# A/B counterpart to qwen3.5-2b.yaml: identical in every other respect,
+# only mask_low_signal_corrections turned on -- see README's "Low-signal
+# correction masking" and Config.mask_low_signal_corrections. Kept as its
+# own file rather than a --set override so the experiment is reproducible
+# from a committed file, not a hand-typed flag.
+#
+# Compare against qwen3.5-2b.yaml's results afterward using
+# test_fix_rate_recoverable / test_targeted_score / test_entity_fix_rate_recoverable
+# (see README's "Test-set evaluation"), not test_wer -- masking removes
+# training signal on words that were never predictable in the first place,
+# so aggregate WER isn't the metric this change is meant to move, and may
+# not improve (or may even tick slightly worse) even if the change works as
+# intended.
+#
+# Batch size: per-device 2 with gradient_accumulation 8 (effective batch
+# size 16). Measured, not estimated -- per-device 4 was tried first (a
+# hoped-for throughput improvement) and OOM'd on a 32GB RTX 5090, so this was
+# reverted back to 2. Revisit raising it again only after separately testing
+# use_unsloth and/or quantization.load_in_4bit, both of which free up real
+# VRAM and haven't been tried yet.
+
+
+model_id: Qwen/Qwen3.5-2B
+dataset_id: ./asr_dataset_curated.jsonl
+train_split: train
+eval_split: null
+eval_fraction: 0.1
+train_fraction: null   # null -> use every row; set e.g. 0.2 for a data-scaling ablation
+input_column: text_whisper
+target_column: text
+system_prompt: null
+
+output_dir: ./outputs/qwen3.5-2b-masked
+max_length: 2048   # see base.yaml's comment -- assembled rows are now per-channel full-call text
+on_long_example: drop   # drop | truncate
+
+# The one difference from qwen3.5-2b.yaml -- see this file's header comment.
+mask_low_signal_corrections: true
+mask_min_similarity: 0.75
+mask_max_common_freq: 1
+
+training:
+  # 2, not 3 -- see base.yaml's comment: extra epochs risk overfitting,
+  # compounded by prepare_split.py's row upsampling.
+  num_train_epochs: 2.0
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
+  logging_steps: 10
+  eval_steps: 100
+  save_steps: 100
+  save_total_limit: 3
+  seed: 42
+
+lora:
+  r: 32   # up from 16 -- alpha doubled alongside it to keep the alpha/r=2 scale unchanged
+  alpha: 64
+  dropout: 0.05
+
+quantization:
+  load_in_4bit: false
+
+hub:
+  push_to_hub: true
+  repo_id: PedramR/ASR_Post-processing   # same shared repo as qwen3.5-2b.yaml
+  folder: null   # null -> defaults to output_dir's basename ("qwen3.5-2b-masked" here)
+  private: false
+
+tensorboard:
+  logging_dir: null   # null -> defaults to <output_dir>/tb
+
+test:
+  dataset_id: ErfanRou/callcc-test-1k
+  split: test
+  input_column: text_whisper
+  target_column: text
+  max_new_tokens: 1024
+  # Up from 8 -- generation has no gradient/optimizer memory of its own, but
+  # this still runs inside the training process's existing GPU footprint
+  # (LoRA + AdamW state are already resident during a mid-training eval).
+  # Measured: this reproduced a CUDA OOM on the step right after the first
+  # checkpoint eval, twice, on a 32GB RTX 5090 -- not a raw capacity problem
+  # (the error showed ~7.5GiB "reserved but unallocated") but generation's
+  # KV-cache churn fragmenting PyTorch's allocator badly enough to break the
+  # next backward pass. Mitigated via torch.cuda.empty_cache() in
+  # evaluate.py's run_test_eval() + PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+  # (run.sh) -- if it recurs anyway, drop this back down before anything else.
+  batch_size: 16
+  max_examples: null   # full test set -- only used for the one-time baseline/final evals
+  # Repeated per-checkpoint eval (every eval_steps/save_steps) uses a much
+  # smaller slice instead, since callcc-test-1k's full ~1k examples at
+  # max_new_tokens=1024 was taking ~3h per pass -- multiplied across ~635
+  # checkpoint saves in this run, that dwarfs training time itself. Adjust
+  # if the trend signal is too noisy or still too slow.
+  checkpoint_max_examples: 150
+  # Small, ground-truth-backed named-entity slice of callcc-test-1k (1,010
+  # rows -- CRM-confirmed names plus a teammate's Gemini entity extraction,
+  # see src/build_entity_eval_slice.py's --entities-dir) -- see README's
+  # "Named-entity eval slice". Tracked separately (test_entity_wer etc.) so
+  # weak entity correction can't hide inside the aggregate test_wer number.
+  # Shares a repo with typo_dataset_id below -- see README's "Uploading the
+  # eval slices as one Hub dataset" -- entity_row_type filters back down to
+  # just this slice's rows.
+  entity_dataset_id: PedramR/ASR_Post-processing-eval
+  entity_row_type: entity
+  # 358-row typo/dictation-form regression-guard slice -- see
+  # src/build_typo_eval_slice.py. Tracks that entity upsampling doesn't
+  # quietly erode the dictation-error correction that already works well.
+  typo_dataset_id: PedramR/ASR_Post-processing-eval
+  typo_row_type: typo
+  # Weight on fix_rate vs. preservation_rate in targeted_score -- see
+  # README's "Test-set evaluation". 0.5 (equal weight) for now.
+  fix_weight: 0.5
+
+resume_from_checkpoint: false
