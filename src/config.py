@@ -58,6 +58,9 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "baseline": "test_baseline",
         "entity_dataset_id": "test_entity_dataset_id",
         "typo_dataset_id": "test_typo_dataset_id",
+        "entity_row_type": "test_entity_row_type",
+        "typo_row_type": "test_typo_row_type",
+        "fix_weight": "test_fix_weight",
     },
 }
 
@@ -108,6 +111,11 @@ class Config:
     mask_low_signal_corrections: bool = False
     # Phonetic/character similarity threshold (0-1, higher = stricter) below
     # which a correction is masked out -- see low_signal_word_spans().
+    # Also governs evaluate.py's fix_rate_recoverable, which drops the same
+    # corrections from its denominator -- so what training declines to teach
+    # and what eval declines to score stay in sync. That one applies
+    # regardless of mask_low_signal_corrections (an eval metric shouldn't
+    # change meaning depending on whether a training feature is on).
     mask_min_similarity: float = 0.75
     # A phonetically-dissimilar correction is only masked if at least one of
     # its words occurs at most this many times across the whole training
@@ -117,6 +125,24 @@ class Config:
     # produced nothing for always scores 0 similarity by construction
     # regardless of how common it is. See low_signal_word_spans().
     mask_max_common_freq: int = 1
+    # Multiplies the per-token loss for target tokens inside a genuine,
+    # recoverable correction (Whisper got it wrong, but mask_min_similarity/
+    # mask_max_common_freq above say it's guessable) -- see data.py's
+    # recoverable_correction_word_ranges()/build_example() and
+    # train.py's WeightedLossTrainer. 1.0 (the default) is a no-op: every
+    # token trains at the normal weight, and train.py uses the plain
+    # `Trainer`, not `WeightedLossTrainer`, so this being unused changes
+    # nothing about how a run behaves. Raise it to counteract these tokens
+    # being a small minority in any example (most of the target is
+    # already-correct passthrough text, or with mask_low_signal_corrections
+    # on, the least-recoverable corrections are removed from the loss
+    # entirely) -- reuses mask_min_similarity/mask_corpus_freq/
+    # mask_max_common_freq as its own "is this guessable" signals rather
+    # than a second, possibly-disagreeing set of thresholds, since both
+    # features are answering the same underlying question about the same
+    # word (see word_correction_categories()). Independent of
+    # mask_low_signal_corrections -- either can be on without the other.
+    recoverable_correction_weight: float = 1.0
 
     num_train_epochs: float = 3.0
     per_device_train_batch_size: int = 4
@@ -259,6 +285,31 @@ class Config:
     # point of tracking it is catching if pushing harder on entity
     # correction (prepare_split.py's entity upsampling) quietly erodes it.
     test_typo_dataset_id: str | None = None
+    # If test_entity_dataset_id points at a combined eval repo holding
+    # several eval slices in one split, distinguished by a `row_type` column
+    # (see build_eval_dataset.py), set this to the value ("entity") that
+    # marks this slice's rows -- after loading, only rows with
+    # row_type == this are scored, same result as a dedicated per-slice
+    # repo/local file. Leave null (the default) for the latter, where every
+    # row already belongs to this slice.
+    test_entity_row_type: str | None = None
+    # Same idea as test_entity_row_type, but for test_typo_dataset_id
+    # (typically "typo").
+    test_typo_row_type: str | None = None
+    # Weight on fix_rate (vs. preservation_rate) in targeted_score, every
+    # test.* eval's third correction-accuracy metric alongside wer/
+    # exact_match/hallucination_rate (see evaluate.py's run_test_eval):
+    # aligns text_whisper against the reference to split every reference
+    # word into "Whisper got this wrong" (fix_rate = how often the
+    # prediction corrects those) vs. "Whisper already had this right"
+    # (preservation_rate = how often the prediction doesn't break those).
+    # targeted_score = fix_weight * fix_rate + (1 - fix_weight) *
+    # preservation_rate. 0.5 (the default) weighs them equally; raise it
+    # to prioritize catching more errors even at the cost of some
+    # over-correction, lower it to prioritize not touching text that was
+    # already fine. fix_rate/preservation_rate themselves are always
+    # reported unweighted, regardless of this setting.
+    test_fix_weight: float = 0.5
 
 
 def _flatten(raw: dict[str, Any]) -> dict[str, Any]:

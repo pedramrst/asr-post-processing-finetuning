@@ -9,6 +9,9 @@ tensorboard
 tqdm
 python-dotenv
 jiwer
+# Persian ZWNJ/spacing + informal-word normalization for evaluate.py's
+# *_lenient metrics -- see src/persian_normalize.py
+hazm
 # needed for `./run.sh agent` (see README's "Telegram agent" section):
 # openai actually places the calls (via OpenRouter, any model); anthropic is
 # kept only for its @beta_tool schema-generation convenience in tools.py,
