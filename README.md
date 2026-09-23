@@ -275,11 +275,17 @@ raises an error immediately rather than being silently ignored:
 - `resume_from_checkpoint`: `false`, `true` (resume from the latest local
   checkpoint), a local checkpoint path, or `"hub"` to pull this run's folder
   from `hub.repo_id` first.
+- `lora_init_mode` / `init_lora_from` / `init_lora_from_subfolder`: opt-in
+  feature flag for starting this run's LoRA from an existing adapter
+  (`"continue"`) or merging one into the base model before attaching a
+  fresh new LoRA (`"merge_and_new"`), instead of the default `"fresh"`
+  zero-initialized start -- see "Continuing from an existing LoRA" below.
 
 Whatever you put in a config, `train.py` writes the fully-resolved version to
 `<output_dir>/config.yaml` at the start of every run -- this is what
-`notebooks/load_model.ipynb` reads `model_id`/`system_prompt` back out of
-later, and it's your record of exactly what produced a given checkpoint.
+`notebooks/load_model.ipynb` reads `model_id`/`system_prompt`/`lora_init_mode`
+back out of later, and it's your record of exactly what produced a given
+checkpoint.
 
 ## 3. Train
 
@@ -327,6 +333,82 @@ latest checkpoint under `output_dir`. To resume on a fresh machine (e.g. the
 local `output_dir` was lost), set it to `"hub"` instead: this run's folder is
 downloaded from `hub.repo_id` first, then resumed from the latest checkpoint
 in it as normal.
+
+### Continuing from an existing LoRA
+
+Three ways this run's LoRA can start, set via `lora_init_mode` -- distinct
+from "Resume a run" above, which restores an *in-progress* run's own full
+trainer state (optimizer/scheduler/global_step) to continue it in place.
+All three modes here instead start a genuinely **new** run (fresh
+optimizer/scheduler/step count, free to use different data/hyperparameters/
+`output_dir`/`hub.repo_id` entirely) that merely *begins* from
+previously-learned weights -- `train.py` raises if `lora_init_mode` isn't
+`"fresh"` and `resume_from_checkpoint` is also set, since combining them is
+almost certainly a mistake, not a real "use both" case.
+
+- **`fresh`** (default): the usual zero-initialized LoRA `B` matrix on the
+  base model. `init_lora_from` must be unset.
+- **`continue`**: loads `init_lora_from`'s adapter weights as this run's own
+  starting LoRA and keeps training that same adapter. Uses *this run's own*
+  `lora_r`/`lora_alpha` (via the normal `LoraConfig`/`get_peft_model` setup)
+  -- a shape mismatch against the adapter being loaded is a loud, explicit
+  error (`ValueError`), not a silent fallback to the adapter's own shape.
+  Verified directly: `missing_keys` from `peft.set_peft_model_state_dict`
+  is near-useless as a mismatch signal on its own -- it's dominated by every
+  frozen base-model weight (`base_layer.weight`, `embed_tokens`, `lm_head`,
+  ...), which are never part of a saved LoRA adapter's state dict and are
+  "missing" even on a perfectly successful load (21 such keys observed on a
+  trivial matching-shape test) -- so only a `lora_`-named missing key, or
+  any `unexpected_keys`, is treated as a real problem. A genuine rank
+  mismatch on a matching key name raises a raw `RuntimeError` directly
+  (verified directly, not assumed) rather than returning gracefully, which
+  is caught and re-raised as a clearer `ValueError`.
+- **`merge_and_new`**: permanently folds `init_lora_from`'s adapter into the
+  base model first (`PeftModel.from_pretrained(...).merge_and_unload()`),
+  then attaches a brand-new, zero-initialized LoRA on top of that merged
+  model and trains it -- lets a new LoRA use fresh capacity instead of
+  competing for space in the same rank-`r` matrices as everything already
+  learned, and its own rank/alpha can differ from the merged-in adapter's.
+  Uses `PeftModel.from_pretrained` here (not the manual
+  `LoraConfig`+`load_peft_weights` path `continue` uses), since this is only
+  a temporary wrapper purely for merging -- it should reconstruct the
+  *source* adapter's own original shape from its saved `adapter_config.json`
+  automatically, not be constrained to this run's `lora_r`/`lora_alpha` at
+  all. **Not supported together with `use_unsloth`** (untested combination,
+  not implemented -- `train.py` raises if both are set).
+
+`init_lora_from` is a local path or a Hub repo id; `init_lora_from_subfolder`
+is for a Hub repo that holds multiple runs' adapters in per-run subfolders
+(matching this project's own Hub layout, e.g. `qwen3.5-2b` or
+`qwen3.5-2b/best_checkpoint_wer` inside `hub.repo_id`) -- ignored for a
+local path.
+
+**`notebooks/load_model.ipynb` reads `lora_init_mode`/`init_lora_from`/
+`init_lora_from_subfolder` back out of the downloaded run's own
+`config.yaml`.** For `fresh`/`continue`, loading is unchanged (the saved
+adapter is complete and self-contained, structurally no different from any
+other LoRA adapter once training is done). For `merge_and_new`, the run's
+saved adapter only makes sense on top of the *merged* base it was actually
+trained against, not the plain original base model -- since that merged
+model only ever existed in memory during training (never saved separately,
+to avoid a redundant multi-GB checkpoint), the notebook replays the exact
+same merge step using the run's own recorded `init_lora_from`/
+`init_lora_from_subfolder` before applying the run's own adapter on top.
+
+Verified: not against a real GPU run (no CUDA/enough free disk in the
+environment this was built in -- the merge step also isn't supported with
+`use_unsloth`, so it couldn't have used the Unsloth path either way), but
+directly against the actual `train.py`/notebook code paths -- a tiny
+synthetic model (`transformers.LlamaConfig`, a handful of layers, no
+download) run through the real, unmodified functions confirmed: a matching-
+shape `continue` load transfers real (non-zero) weights without a false-
+positive error, a mismatched-shape `continue` load raises the intended
+clear `ValueError`, `merge_and_new` correctly merges then attaches an
+independent new-rank LoRA, and -- with the base model's weights held fixed
+across saves/loads (matching how a real pretrained `model_id` never changes
+between one load and the next) -- the notebook's replay logic reproduces
+the actual trained model's output exactly (max abs diff `0.0` on a forward
+pass through both).
 
 ### Where things end up
 
@@ -759,11 +841,27 @@ decides to type":
 | Group | Tools |
 |---|---|
 | Process control | `check_training_status`, `stop_training`, `run_finetune`, `resume_training` |
-| Config | `edit_config`, `get_effective_config`, `validate_config` |
+| Config | `list_configs`, `get_config`, `edit_config`, `copy_config`, `get_effective_config`, `validate_config` |
 | Data & checkpoints | `build_data`, `list_checkpoints`, `check_hf_upload`, `sync_to_hub` |
 | Results & metrics | `get_checkpoint_metrics`, `get_secondary_eval_metrics`, `sample_predictions`, `query_predictions`, `compare_runs`, `list_available_metrics`, `plot_metrics` |
 | Sweeps | `run_sweep` |
 | Operational health | `check_gpu`, `check_disk_usage`, `tail_log` |
+
+`list_configs`/`get_config` let you discover and read `configs/*.yaml` files
+directly (distinct from `get_effective_config`, which only reads back a
+*run's* already-resolved config after it's started). `copy_config` forks an
+existing config to a new file with field updates applied on the copy --
+e.g. "make a new config from qwen3.5-2b.yaml but push to a different Hub
+repo" -- so a new run's Hub folder/local checkpoints never collide with or
+overwrite an existing run's. Both `edit_config` and `copy_config` use
+`ruamel.yaml`'s round-trip mode, not plain PyYAML, specifically because
+these configs carry extensive hand-written comments explaining *why* each
+value was chosen -- a plain load+dump round-trip silently deletes every
+comment and reformats values (verified directly against a real config
+file); `ruamel.yaml` preserves them. One real limitation worth knowing:
+comments are copied verbatim, so a comment that only made sense in the
+original file (e.g. referencing a repo/setting that `copy_config` just
+changed) can become stale on the copy -- this isn't corrected automatically.
 
 `query_predictions`'s `filter` argument is a small fixed-vocabulary DSL
 (`{"field": ..., "op": ..., "value": ...}`, restricted to known prediction
@@ -799,7 +897,7 @@ resolves back to the matching tag name from what it just listed.
 ### Confirmation
 
 State-changing tools (`stop_training`, `run_finetune`, `resume_training`,
-`edit_config`, `build_data`, `sync_to_hub`, `run_sweep`) take a `confirmed`
+`edit_config`, `copy_config`, `build_data`, `sync_to_hub`, `run_sweep`) take a `confirmed`
 parameter. There's no separate pending-action state machine: the gate lives
 *inside the tool function itself* -- called with `confirmed=False` (the
 default), it describes what it would do without doing it, and the model's

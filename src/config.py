@@ -162,6 +162,33 @@ class Config:
     # false | true (auto-resume from the latest local checkpoint in output_dir) |
     # a local checkpoint path | "hub" to pull this run's folder from hub_repo_id first.
     resume_from_checkpoint: bool | str = False
+    # Three ways this run's LoRA can start -- see README's "Continuing from
+    # an existing LoRA" section. Mutually exclusive with
+    # resume_from_checkpoint (that restores an in-progress run's own full
+    # trainer state -- optimizer/scheduler/global_step -- for continuing an
+    # interrupted run; these three all start a genuinely new run, free to
+    # use different data/hyperparameters/output_dir/hub_repo_id, that merely
+    # *begins* from previously-learned weights):
+    #   "fresh" (default): the usual zero-initialized LoRA B matrix on the
+    #     base model -- init_lora_from must be unset.
+    #   "continue": loads init_lora_from's adapter weights as this run's OWN
+    #     starting LoRA and keeps training that same adapter (fresh
+    #     optimizer/scheduler/step count, but not a fresh/zero-init adapter).
+    #   "merge_and_new": permanently folds init_lora_from's adapter into the
+    #     base model first (PeftModel.merge_and_unload()), then attaches a
+    #     brand-new, zero-initialized LoRA on top of that merged model and
+    #     trains it -- use this to keep stacking incremental adaptations
+    #     without being limited by re-using the same rank-r matrices as
+    #     everything learned before. Not supported together with
+    #     use_unsloth (untested combination; train.py raises if both are set).
+    lora_init_mode: str = "fresh"
+    # Required (a local path or Hub repo id) unless lora_init_mode == "fresh".
+    init_lora_from: str | None = None
+    # Only used alongside init_lora_from, for a Hub repo that holds several
+    # runs' adapters in per-run subfolders (matching this project's own Hub
+    # layout, e.g. "qwen3.5-2b" or "qwen3.5-2b/best_checkpoint_wer" inside
+    # hub_repo_id) -- ignored for a local init_lora_from path.
+    init_lora_from_subfolder: str | None = None
 
     # If set, the model is run against this test set at every checkpoint save
     # (results overwrite test_eval/predictions.jsonl + metrics.json under

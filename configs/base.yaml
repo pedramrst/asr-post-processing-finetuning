@@ -119,3 +119,14 @@ test:
 # false | true (resume from the latest checkpoint under output_dir) |
 # a local checkpoint path | "hub" to pull this run's folder from hub.repo_id first
 resume_from_checkpoint: false
+# Opt-in feature flag -- see README's "Continuing from an existing LoRA"
+# section. Seeds this (brand-new, otherwise free to differ in every other
+# way) run's LoRA weights from an existing adapter instead of the usual
+# zero-initialized start -- a local path, or a Hub repo id (with
+# init_lora_from_subfolder for a repo that holds multiple runs' adapters in
+# per-run subfolders, e.g. "qwen3.5-2b"). Mutually exclusive with
+# resume_from_checkpoint (that restores an in-progress run's own trainer
+# state; this only seeds a new run's starting weights). null (default)
+# keeps the normal zero-initialized LoRA start.
+init_lora_from: null
+init_lora_from_subfolder: null

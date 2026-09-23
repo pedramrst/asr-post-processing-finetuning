@@ -261,6 +261,86 @@ def validate_config(config_path: str) -> str:
         return f"Invalid: {e}"
 
 
+@beta_tool
+def list_configs() -> str:
+    """Lists every YAML config file under configs/, so you can see what's
+    available before inspecting, copying, or launching one."""
+    paths = sorted(glob.glob(str(REPO_ROOT / "configs" / "*.yaml")))
+    if not paths:
+        return "No config files found under configs/"
+    return "\n".join(str(Path(p).relative_to(REPO_ROOT)) for p in paths)
+
+
+@beta_tool
+def get_config(config_path: str) -> str:
+    """Returns a config file's full raw contents (comments included), e.g.
+    to review one before editing or launching it. Distinct from
+    get_effective_config, which reads back a *run's* already-resolved
+    config.yaml, not a source configs/*.yaml file that hasn't been run yet.
+
+    Args:
+        config_path: Path to the YAML config, e.g. "configs/qwen3.5-2b.yaml".
+    """
+    path = Path(config_path)
+    if not path.exists():
+        return f"No config file found at {config_path}"
+    return path.read_text()
+
+
+@beta_tool
+def copy_config(source_config_path: str, new_config_path: str, updates: dict | None = None, confirmed: bool = False) -> str:
+    """Copies an existing config to a new file, optionally applying field
+    updates on the copy -- e.g. to fork a config onto a new Hub repo/output
+    directory for a new run without touching the original or its
+    checkpoints (a different hub.repo_id/hub.folder means the new run's
+    syncs land somewhere else entirely, so the old run's Hub folder is
+    never touched). Comments are preserved (ruamel.yaml round-trip), same
+    as edit_config. Refuses if new_config_path already exists -- use
+    edit_config on it instead.
+
+    Args:
+        source_config_path: Existing config to copy from.
+        new_config_path: Where to write the new config (must not already exist).
+        updates: Optional field updates to apply to the copy, e.g.
+            {"hub": {"repo_id": "PedramR/new-repo", "folder": null},
+            "output_dir": "./outputs/new-run"}.
+        confirmed: Only pass True once the user has explicitly confirmed.
+    """
+    source = Path(source_config_path)
+    dest = Path(new_config_path)
+    if not source.exists():
+        return f"Source config not found: {source_config_path}"
+    if dest.exists():
+        return f"Refused: {new_config_path} already exists -- use edit_config to modify it instead."
+
+    pending = _confirm_gate(confirmed, f"copy {source_config_path} to {new_config_path} with updates={updates or {}}")
+    if pending:
+        return pending
+
+    ryaml = _make_ryaml()
+    with source.open() as f:
+        data = ryaml.load(f) or {}
+    if updates:
+        data = _deep_merge_inplace(data, updates)
+
+    import io
+    import tempfile
+    buf = io.StringIO()
+    ryaml.dump(data, buf)
+    new_text = buf.getvalue()
+
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+            f.write(new_text)
+            tmp_path = f.name
+        load_config(tmp_path)
+    except Exception as e:
+        return f"Validation failed, {new_config_path} was NOT created: {e}"
+
+    dest.write_text(new_text)
+    return f"Created {new_config_path} (copied from {source_config_path}, updates={updates or {}})"
+
+
 # --------------------------------------------------------------------------
 # Data & checkpoints
 # --------------------------------------------------------------------------
@@ -727,6 +807,7 @@ def tail_log(n: int = 50) -> str:
 ALL_TOOLS = [
     check_training_status, stop_training, run_finetune, resume_training,
     edit_config, get_effective_config, validate_config,
+    list_configs, get_config, copy_config,
     build_data, list_checkpoints, check_hf_upload, sync_to_hub,
     get_checkpoint_metrics, get_secondary_eval_metrics, sample_predictions,
     query_predictions, compare_runs, plot_metrics, list_available_metrics,

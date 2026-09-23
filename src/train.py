@@ -138,6 +138,32 @@ def main() -> None:
         raise ValueError("hub.push_to_hub is true but hub.repo_id is not set.")
     if cfg.on_long_example not in ("drop", "truncate"):
         raise ValueError(f"on_long_example must be 'drop' or 'truncate', got {cfg.on_long_example!r}")
+    if cfg.lora_init_mode not in ("fresh", "continue", "merge_and_new"):
+        raise ValueError(f"lora_init_mode must be 'fresh', 'continue', or 'merge_and_new', got {cfg.lora_init_mode!r}")
+    if cfg.lora_init_mode == "fresh" and cfg.init_lora_from:
+        raise ValueError(
+            "init_lora_from is set but lora_init_mode is 'fresh' -- set lora_init_mode to "
+            "'continue' or 'merge_and_new', or clear init_lora_from."
+        )
+    if cfg.lora_init_mode != "fresh" and not cfg.init_lora_from:
+        raise ValueError(f"lora_init_mode={cfg.lora_init_mode!r} requires init_lora_from to be set.")
+    if cfg.lora_init_mode == "merge_and_new" and cfg.use_unsloth:
+        raise ValueError(
+            "lora_init_mode='merge_and_new' is not supported together with use_unsloth "
+            "(untested combination, not implemented) -- set use_unsloth: false."
+        )
+    if cfg.lora_init_mode != "fresh" and cfg.resume_from_checkpoint:
+        # Two different starting strategies: resume_from_checkpoint restores
+        # this run's own optimizer/scheduler/global_step (continuing an
+        # interrupted run in place); lora_init_mode='continue'/'merge_and_new'
+        # only seed a brand-new run's weights (fresh optimizer/step count,
+        # possibly different data/hyperparameters/output entirely). Setting
+        # both is almost certainly a mistake, not a real "use both" case.
+        raise ValueError(
+            "lora_init_mode != 'fresh' and resume_from_checkpoint are mutually exclusive -- "
+            "resume_from_checkpoint continues THIS run's own trainer state; "
+            "lora_init_mode='continue'/'merge_and_new' seed a NEW run's weights from a different adapter."
+        )
     warn_if_punctuation_flag_inconsistent(cfg)
 
     output_dir = Path(cfg.output_dir)
@@ -210,6 +236,24 @@ def main() -> None:
         model.config.pad_token_id = tokenizer.pad_token_id
         model.enable_input_require_grads()
 
+        if cfg.lora_init_mode == "merge_and_new":
+            # Permanently folds an existing adapter into the base model
+            # before any NEW LoRA is attached, so the new LoRA gets fresh
+            # capacity instead of fighting for space in the same rank-r
+            # matrices as everything already learned. PeftModel.from_pretrained
+            # (not the manual LoraConfig+load_peft_weights path used for
+            # "continue" below) reads the adapter's own saved adapter_config.json
+            # to reconstruct its exact original shape -- required here since
+            # this is a temporary wrapper purely for merging, not the run's
+            # own LoRA config, so there's no reason it should have to match
+            # cfg.lora_r/lora_alpha at all.
+            from peft import PeftModel
+
+            merge_kwargs = {"subfolder": cfg.init_lora_from_subfolder} if cfg.init_lora_from_subfolder else {}
+            model = PeftModel.from_pretrained(model, cfg.init_lora_from, **merge_kwargs)
+            model = model.merge_and_unload()
+            print(f"Merged existing LoRA from {cfg.init_lora_from} (subfolder={cfg.init_lora_from_subfolder}) into the base model.")
+
         lora_config = LoraConfig(
             r=cfg.lora_r,
             lora_alpha=cfg.lora_alpha,
@@ -220,6 +264,55 @@ def main() -> None:
         )
         model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+
+    if cfg.lora_init_mode == "continue":
+        # Seeds this brand-new run's LoRA weights from an existing adapter
+        # (a local path, or a Hub repo id -- optionally with
+        # init_lora_from_subfolder for a repo that holds several runs'
+        # adapters in per-run subfolders, matching this project's own Hub
+        # layout) -- NOT the same thing as resume_from_checkpoint (see the
+        # validation above): only the adapter weights are loaded, not
+        # optimizer/scheduler/global_step, so this run starts at step 0 with
+        # its own (possibly entirely different) data/hyperparameters/output,
+        # just not from LoRA's usual zero-initialized B matrix. Uses this
+        # run's OWN lora_r/lora_alpha (via get_peft_model above), not
+        # whatever shape the source adapter happens to have -- a mismatch is
+        # a loud, explicit error below, not a silent fallback to the
+        # adapter's own shape (unlike merge_and_new's PeftModel.from_pretrained,
+        # where there's no "this run's own shape" yet to conflict with).
+        from peft import load_peft_weights, set_peft_model_state_dict
+
+        load_kwargs = {}
+        if cfg.init_lora_from_subfolder:
+            load_kwargs["subfolder"] = cfg.init_lora_from_subfolder
+        state_dict = load_peft_weights(cfg.init_lora_from, **load_kwargs)
+        mismatch_msg = (
+            f"init_lora_from={cfg.init_lora_from!r} (subfolder={cfg.init_lora_from_subfolder!r}) "
+            f"doesn't match this run's LoRA shape -- lora_r/lora_alpha/target_modules must match "
+            f"the adapter being loaded."
+        )
+        try:
+            load_result = set_peft_model_state_dict(model, state_dict)
+        except RuntimeError as e:
+            # A same-name-different-shape mismatch (e.g. a different lora_r)
+            # raises directly here rather than returning gracefully --
+            # verified directly against a real load, not assumed.
+            raise ValueError(f"{mismatch_msg} Underlying error: {e}") from e
+        # missing_keys is near-useless as a mismatch signal here: it's
+        # dominated by every frozen base-model weight (base_layer.weight,
+        # embed_tokens, lm_head, ...), which are never part of a saved LoRA
+        # adapter's state dict at all and are "missing" even on a perfectly
+        # successful load -- verified directly (21 such keys on a trivial
+        # matching-shape load). Only a *lora_*-named missing key, or any
+        # unexpected_keys (a saved key that doesn't match this model's
+        # target_modules at all, e.g. a different module set), is a real
+        # problem worth failing on.
+        lora_missing = [k for k in load_result.missing_keys if "lora_" in k]
+        if lora_missing or load_result.unexpected_keys:
+            raise ValueError(
+                f"{mismatch_msg} missing LoRA keys={lora_missing}, unexpected_keys={load_result.unexpected_keys}"
+            )
+        print(f"Initialized LoRA weights from {cfg.init_lora_from} (subfolder={cfg.init_lora_from_subfolder})")
 
     raw = load_sft_dataset(
         cfg.dataset_id,
