@@ -30,10 +30,18 @@ import yaml
 from dotenv import load_dotenv
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+from transformers.integrations import TensorBoardCallback
 
 from config import Config, load_config
 from data import PadCollator, build_example, load_sft_dataset, resolve_system_prompt
-from evaluate import TestEvalCallback, run_secondary_eval, run_test_eval, update_best_checkpoint
+from evaluate import (
+    TestEvalCallback,
+    format_test_metrics,
+    run_secondary_eval,
+    run_test_eval,
+    test_log_values,
+    update_best_checkpoint,
+)
 from hub_sync import SyncToHubCallback, repo_folder_name, sync_output_dir
 
 load_dotenv()
@@ -569,22 +577,9 @@ def main() -> None:
             low_signal_min_similarity=cfg.mask_min_similarity,
             low_signal_max_common_freq=cfg.mask_max_common_freq,
         )
-        print(f"Baseline: wer={baseline_metrics['wer']}, exact_match={baseline_metrics['exact_match']}, "
-              f"hallucination_rate={baseline_metrics['hallucination_rate']}, "
-              f"fix_rate={baseline_metrics['fix_rate']}, preservation_rate={baseline_metrics['preservation_rate']}")
+        print(f"Baseline: {format_test_metrics(baseline_metrics)}")
         if baseline_metrics["wer"] is not None:
-            trainer.log({
-                "test_wer": baseline_metrics["wer"],
-                "test_wer_zwnj_normalized": baseline_metrics["wer_zwnj_normalized"],
-                "test_exact_match": baseline_metrics["exact_match"],
-                "test_hallucination_rate": baseline_metrics["hallucination_rate"],
-                "test_fix_rate": baseline_metrics["fix_rate"],
-                "test_preservation_rate": baseline_metrics["preservation_rate"],
-                "test_targeted_score": baseline_metrics["targeted_score"],
-                "test_fix_rate_lenient": baseline_metrics["fix_rate_lenient"],
-                "test_preservation_rate_lenient": baseline_metrics["preservation_rate_lenient"],
-                "test_targeted_score_lenient": baseline_metrics["targeted_score_lenient"],
-            })
+            trainer.log(test_log_values(baseline_metrics))
 
         for name, ds_id, subdir in [
             ("entity", cfg.test_entity_dataset_id, "test_eval_entity_baseline"),
@@ -593,8 +588,7 @@ def main() -> None:
             secondary_metrics = run_secondary_eval(
                 model, tokenizer, cfg, ds_id, name, subdir, trainer, corpus_freq)
             if secondary_metrics is not None:
-                print(f"Baseline ({name} slice): wer={secondary_metrics['wer']}, "
-                      f"exact_match={secondary_metrics['exact_match']}")
+                print(f"Baseline ({name} slice): {format_test_metrics(secondary_metrics)}")
 
     trainer.train(resume_from_checkpoint=resume_checkpoint)
     trainer.save_model(cfg.output_dir)
@@ -628,12 +622,29 @@ def main() -> None:
         # files, not a numbered checkpoint) -- update_best_checkpoint's ignore
         # patterns exist specifically so this doesn't copy output_dir into a
         # subdirectory of itself.
-        update_best_checkpoint(cfg.output_dir, cfg.output_dir, final_metrics, trainer.state.global_step)
+        _, best_wer = update_best_checkpoint(cfg.output_dir, cfg.output_dir, final_metrics, trainer.state.global_step)
+        print(f"Final: {format_test_metrics(final_metrics)}, best_wer={best_wer if best_wer is not None else 'n/a'}")
+        if final_metrics["wer"] is not None:
+            log_values = test_log_values(final_metrics)
+            if best_wer is not None:
+                log_values["test_best_wer"] = best_wer
+            trainer.log(log_values)
 
-        run_secondary_eval(model, tokenizer, cfg, cfg.test_entity_dataset_id, "entity",
-                            "test_eval_entity", None, corpus_freq)
-        run_secondary_eval(model, tokenizer, cfg, cfg.test_typo_dataset_id, "typo",
-                            "test_eval_typo", None, corpus_freq)
+        for name, ds_id, subdir in [
+            ("entity", cfg.test_entity_dataset_id, "test_eval_entity"),
+            ("typo", cfg.test_typo_dataset_id, "test_eval_typo"),
+        ]:
+            secondary_metrics = run_secondary_eval(
+                model, tokenizer, cfg, ds_id, name, subdir, trainer, corpus_freq)
+            if secondary_metrics is not None:
+                print(f"Final ({name} slice): {format_test_metrics(secondary_metrics)}")
+        # TensorBoardCallback closes its writer in on_train_end and lazily
+        # reopens it for the trainer.log() calls above -- close it again so
+        # those final points are flushed to disk before the Hub sync below.
+        for cb in trainer.callback_handler.callbacks:
+            if isinstance(cb, TensorBoardCallback) and cb.tb_writer is not None:
+                cb.tb_writer.close()
+                cb.tb_writer = None
     if cfg.push_to_hub:
         sync_output_dir(cfg, commit_message="final")
 

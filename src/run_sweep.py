@@ -97,6 +97,33 @@ def _test_wer(output_dir: Path) -> float | None:
     return json.loads(metrics_path.read_text()).get("wer")
 
 
+# The final eval's metrics.json per slice (written by evaluate.py's
+# run_test_eval()) -- read back here rather than recomputed, same as
+# _test_wer() above.
+_EVAL_SUBDIRS = {"main": "test_eval", "entity": "test_eval_entity", "typo": "test_eval_typo"}
+
+
+def _eval_metrics(output_dir: Path) -> dict[str, dict[str, Any]]:
+    metrics = {}
+    for slice_name, subdir in _EVAL_SUBDIRS.items():
+        metrics_path = output_dir / subdir / "metrics.json"
+        if metrics_path.exists():
+            metrics[slice_name] = json.loads(metrics_path.read_text())
+    return metrics
+
+
+def _format_metrics(metrics: dict[str, Any]) -> str:
+    return " ".join(
+        f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v if v is not None else 'n/a'}"
+        for k, v in metrics.items()
+    )
+
+
+def _print_eval_metrics(eval_metrics: dict[str, dict[str, Any]], indent: str = "    ") -> None:
+    for slice_name, metrics in eval_metrics.items():
+        print(f"{indent}{slice_name:6s}  {_format_metrics(metrics)}", flush=True)
+
+
 def _launch_followup(output_root: Path, winner: dict) -> None:
     """Auto-continues the sweep's winner with a longer follow-up run,
     resumed from its best checkpoint -- routed through
@@ -153,8 +180,13 @@ def main() -> None:
         status = "ok" if proc.returncode == 0 else f"failed (exit {proc.returncode})"
         best_loss = _best_eval_loss(output_root / name)
         test_wer = _test_wer(output_root / name)
-        results.append({"name": name, "status": status, "best_eval_loss": best_loss, "test_wer": test_wer})
+        eval_metrics = _eval_metrics(output_root / name)
+        results.append({
+            "name": name, "status": status, "best_eval_loss": best_loss, "test_wer": test_wer,
+            "eval_metrics": eval_metrics,
+        })
         print(f"=== Job '{name}': {status}, best eval_loss={best_loss}, test_wer={test_wer} ===", flush=True)
+        _print_eval_metrics(eval_metrics)
 
     print("\n=== Sweep summary ===")
     # test_wer is the metric that actually answers "which model corrects
@@ -164,6 +196,7 @@ def main() -> None:
         loss_str = f"{r['best_eval_loss']:.4f}" if r["best_eval_loss"] is not None else "n/a"
         wer_str = f"{r['test_wer']:.4f}" if r["test_wer"] is not None else "n/a"
         print(f"{r['name']:30s}  {r['status']:20s}  test_wer={wer_str}  best_eval_loss={loss_str}")
+        _print_eval_metrics(r["eval_metrics"])
 
     summary_path = output_root / "summary.json"
     summary_path.write_text(json.dumps(results, indent=2))

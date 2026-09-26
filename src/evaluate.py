@@ -515,6 +515,40 @@ def update_best_checkpoint(output_dir: str, source_dir: str, metrics: dict, step
     return True, metrics["wer"]
 
 
+def test_log_values(metrics: dict, prefix: str = "test") -> dict:
+    """The TensorBoard scalars logged for one run_test_eval() result, keyed
+    <prefix>_wer, <prefix>_fix_rate, ... -- shared by the baseline,
+    per-checkpoint and final evals (main set and secondary slices alike) so
+    they always log the same set. fix_rate_recoverable is only included when
+    it's defined (no recoverable-correction targets -> None)."""
+    values = {
+        f"{prefix}_wer": metrics["wer"],
+        f"{prefix}_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
+        f"{prefix}_exact_match": metrics["exact_match"],
+        f"{prefix}_hallucination_rate": metrics["hallucination_rate"],
+        f"{prefix}_fix_rate": metrics["fix_rate"],
+        f"{prefix}_preservation_rate": metrics["preservation_rate"],
+        f"{prefix}_targeted_score": metrics["targeted_score"],
+        f"{prefix}_fix_rate_lenient": metrics["fix_rate_lenient"],
+        f"{prefix}_preservation_rate_lenient": metrics["preservation_rate_lenient"],
+        f"{prefix}_targeted_score_lenient": metrics["targeted_score_lenient"],
+    }
+    if metrics["fix_rate_recoverable"] is not None:
+        values[f"{prefix}_fix_rate_recoverable"] = metrics["fix_rate_recoverable"]
+    return values
+
+
+def format_test_metrics(metrics: dict) -> str:
+    """One-line `wer=0.2012 fix_rate=0.5123 ...` rendering of the same
+    metrics test_log_values() logs -- for terminal output, so what's printed
+    always matches what TensorBoard gets."""
+    values = test_log_values(metrics, prefix="")
+    return " ".join(
+        f"{k.lstrip('_')}={v:.4f}" if isinstance(v, float) else f"{k.lstrip('_')}={v if v is not None else 'n/a'}"
+        for k, v in values.items()
+    )
+
+
 def run_secondary_eval(model, tokenizer, cfg, dataset_id: str | None, name: str, output_subdir: str,
                         trainer=None, low_signal_corpus_freq: Counter | None = None):
     """Runs run_test_eval() against one of cfg's secondary datasets (e.g.
@@ -557,20 +591,7 @@ def run_secondary_eval(model, tokenizer, cfg, dataset_id: str | None, name: str,
         low_signal_max_common_freq=cfg.mask_max_common_freq,
     )
     if trainer is not None and metrics["wer"] is not None:
-        trainer.log({
-            f"test_{name}_wer": metrics["wer"],
-            f"test_{name}_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
-            f"test_{name}_exact_match": metrics["exact_match"],
-            f"test_{name}_hallucination_rate": metrics["hallucination_rate"],
-            f"test_{name}_fix_rate": metrics["fix_rate"],
-            f"test_{name}_preservation_rate": metrics["preservation_rate"],
-            f"test_{name}_targeted_score": metrics["targeted_score"],
-            f"test_{name}_fix_rate_lenient": metrics["fix_rate_lenient"],
-            f"test_{name}_preservation_rate_lenient": metrics["preservation_rate_lenient"],
-            f"test_{name}_targeted_score_lenient": metrics["targeted_score_lenient"],
-            **({f"test_{name}_fix_rate_recoverable": metrics["fix_rate_recoverable"]}
-                if metrics["fix_rate_recoverable"] is not None else {}),
-        })
+        trainer.log(test_log_values(metrics, f"test_{name}"))
     return metrics
 
 
@@ -643,20 +664,7 @@ class TestEvalCallback(TrainerCallback):
                 low_signal_max_common_freq=self.cfg.mask_max_common_freq,
             )
             if metrics["wer"] is not None:
-                log_values = {
-                    "test_wer": metrics["wer"],
-                    "test_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
-                    "test_exact_match": metrics["exact_match"],
-                    "test_hallucination_rate": metrics["hallucination_rate"],
-                    "test_fix_rate": metrics["fix_rate"],
-                    "test_preservation_rate": metrics["preservation_rate"],
-                    "test_targeted_score": metrics["targeted_score"],
-                    "test_fix_rate_lenient": metrics["fix_rate_lenient"],
-                    "test_preservation_rate_lenient": metrics["preservation_rate_lenient"],
-                    "test_targeted_score_lenient": metrics["targeted_score_lenient"],
-                }
-                if metrics["fix_rate_recoverable"] is not None:
-                    log_values["test_fix_rate_recoverable"] = metrics["fix_rate_recoverable"]
+                log_values = test_log_values(metrics)
 
         # Best-checkpoint tracking (see Config.test_checkpoint_eval_main's
         # docstring for the fallback's reasoning): prefer the main test
