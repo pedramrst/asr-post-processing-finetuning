@@ -24,12 +24,20 @@
 #     plain path's "all-linear" covers -- a smaller adapter than earlier
 #     runs, so not comparable to them; (2) WeightedLossTrainer's own loss
 #     has never been run together with Unsloth. Still unverified end-to-end.
-#   - training.eval_steps/save_steps: 500 (up from 100) -- fewer, less
-#     disruptive checkpoint pauses.
+#   - training.eval_steps/save_steps: 1000 (up from 100, then 500) -- the
+#     run is ~11,000 steps (50% of ~184k rows, ~3.7% dropped as too long,
+#     2 epochs at effective batch 16), so ~11 checkpoints. Each one runs the
+#     full entity+typo eval, so this roughly halves eval time vs. 500, while
+#     keeping enough checkpoints to catch an early best one (the 1% smoke
+#     run's best WER came early, before repeat loops grew) and capping
+#     what a crash loses to ~1h of training. save_steps is what actually
+#     triggers the eval -- eval_steps does nothing here (no validation
+#     split with a Hub dataset and eval_split: null), kept equal for
+#     consistency.
 #   - test.checkpoint_max_examples: null -- was 150; now every checkpoint
 #     eval covers the full test set (falls back to test.max_examples, also
 #     null), not just the one-time baseline/final passes. Affordable now
-#     that checkpoints are 5x less frequent (500 vs. 100 steps apart).
+#     that checkpoints are 10x less frequent (1000 vs. 100 steps apart).
 #   - test.checkpoint_eval_main: false -- the *combination* of the previous
 #     point with eval_steps=500 (not 100) turned out not to be the win it
 #     looked like on its own: null checkpoint_max_examples means the main
@@ -80,8 +88,8 @@ jobs:
       train_fraction: 0.5
       use_unsloth: false
       training:
-        eval_steps: 500
-        save_steps: 500
+        eval_steps: 1000
+        save_steps: 1000
       test:
         checkpoint_max_examples: null
         checkpoint_eval_main: false
