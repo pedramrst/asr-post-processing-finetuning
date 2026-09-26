@@ -637,8 +637,15 @@ repeat loop that never finds the actual stopping point and just fills
 roughly 1 in 6-7 test examples and single-handedly dragged the aggregate
 `wer`/`hallucination_rate` far worse than the untrained baseline, even
 though the ~85% of predictions that didn't degenerate were good corrections.
-With both off, that failure can come back; `test.max_new_tokens` is what
-bounds it.
+With both off, `generate_batch()`'s loop guard (`_LoopGuard` in
+`evaluate.py`) handles that failure instead, looking only at *generated*
+tokens: a row stops as soon as its output ends in one unit of 1-20 tokens
+repeated 8 times back to back, and that repeated tail is trimmed to a single
+copy. Each row is also capped at 1.5x its own prompt length. Observed on a
+smoke run with both settings off: 7 of 20 outputs looped on `بله` bursts or
+a short phrase until `max_new_tokens`, driving aggregate WER from ~0.2 on
+the normal rows to 1.3 overall. The guard prints how many outputs it
+stopped per eval.
 
 `test.max_examples` caps the *baseline* (below) and *final* evals -- each
 only runs once per training run, so leaving it `null` (the full test set) is

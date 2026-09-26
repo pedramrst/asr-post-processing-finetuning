@@ -25,7 +25,7 @@ from datasets import Dataset
 from dotenv import load_dotenv
 from huggingface_hub import HfFileSystem
 from tqdm import tqdm
-from transformers import TrainerCallback
+from transformers import StoppingCriteria, StoppingCriteriaList, TrainerCallback
 from transformers.trainer import PREFIX_CHECKPOINT_DIR
 
 from data import SYSTEM_PROMPT, load_local_jsonl_columns, low_signal_word_ranges, resolve_system_prompt
@@ -121,6 +121,62 @@ def _word_overlap_pct(a: str, b: str) -> float:
     return round(sum((ca & cb).values()) / len(wa) * 100, 2)
 
 
+# Repeat-loop guard for generate_batch() -- see _LoopGuard. A generated tail
+# made of one unit of 1..LOOP_MAX_PERIOD tokens repeated LOOP_MIN_REPEATS
+# times back to back counts as a loop. 20 tokens covers the multi-word loops
+# actually observed ("زده بودم ولی گلم", "هزار و نهصد نهصد هشت"); 8 repeats is
+# well past any natural burst in real transcripts (e.g. "بله بله بله").
+LOOP_MAX_PERIOD = 20
+LOOP_MIN_REPEATS = 8
+# Backstop cap on each row's output, relative to its own (unpadded) prompt
+# length -- the prompt includes the system prompt, so this is loose for short
+# inputs, but still far below max_new_tokens for them.
+MAX_OUTPUT_TO_PROMPT_RATIO = 1.5
+
+
+class _LoopGuard(StoppingCriteria):
+    """Stops each row of a batch independently once its *generated* tokens
+    end in a repeat loop (see LOOP_MAX_PERIOD/LOOP_MIN_REPEATS), or once it
+    has generated more than its own per-row cap.
+
+    Only ever looks at tokens after the (left-padded, so shared) prompt
+    length -- unlike generate()'s repetition_penalty/no_repeat_ngram_size,
+    which also act on the prompt and so forbid copying the input transcript
+    (see Config.test_repetition_penalty).
+    """
+
+    def __init__(self, prompt_len: int, max_new_per_row: torch.Tensor):
+        self.prompt_len = prompt_len
+        self.max_new_per_row = max_new_per_row
+
+    def __call__(self, input_ids, scores, **kwargs):
+        gen = input_ids[:, self.prompt_len:]
+        n = gen.shape[1]
+        done = n >= self.max_new_per_row
+        for period in range(1, LOOP_MAX_PERIOD + 1):
+            span = period * LOOP_MIN_REPEATS
+            if span > n:
+                break
+            tail = gen[:, -span:]
+            done |= (tail[:, period:] == tail[:, :-period]).all(-1)
+        return done
+
+
+def _trim_trailing_loop(tokens: list[int]) -> tuple[list[int], bool]:
+    """Cuts a trailing repeat loop (as _LoopGuard detects it) down to a
+    single copy of the repeated unit. Returns (tokens, whether it trimmed)."""
+    for period in range(1, LOOP_MAX_PERIOD + 1):
+        span = period * LOOP_MIN_REPEATS
+        if span > len(tokens):
+            break
+        start = len(tokens) - span
+        if all(tokens[i] == tokens[i + period] for i in range(start, len(tokens) - period)):
+            while start > 0 and tokens[start - 1] == tokens[start - 1 + period]:
+                start -= 1
+            return tokens[: start + period], True
+    return tokens, False
+
+
 @torch.no_grad()
 def generate_batch(
     model,
@@ -154,11 +210,18 @@ def generate_batch(
     can be much slower than it needs to be. Sorting first (then restoring
     original order before returning) removes that waste for free; longest
     first also surfaces an OOM immediately rather than partway through.
+
+    Repeat loops are handled by _LoopGuard instead of repetition_penalty/
+    no_repeat_ngram_size (both default off -- they act on the prompt too and
+    forbid copying the input): a looping row stops early and its repeated
+    tail is trimmed to one copy, so a loop costs neither generation time up
+    to max_new_tokens nor hundreds of junk words in that row's WER.
     """
     order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]), reverse=True)
     sorted_prompts = [prompts[i] for i in order]
 
     outputs_sorted = []
+    n_loops = 0
     prior_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"  # so every sequence in a batch ends at the same index
     try:
@@ -167,6 +230,8 @@ def generate_batch(
             batch = sorted_prompts[i : i + batch_size]
             enc = tokenizer(batch, return_tensors="pt", padding=True, add_special_tokens=False)
             enc = {k: v.to(model.device) for k, v in enc.items()}
+            prompt_len = enc["input_ids"].shape[1]
+            max_new_per_row = (enc["attention_mask"].sum(-1) * MAX_OUTPUT_TO_PROMPT_RATIO).ceil().long()
             generated = model.generate(
                 **enc,
                 max_new_tokens=max_new_tokens,
@@ -174,11 +239,19 @@ def generate_batch(
                 pad_token_id=tokenizer.pad_token_id,
                 repetition_penalty=repetition_penalty,
                 no_repeat_ngram_size=no_repeat_ngram_size,
+                stopping_criteria=StoppingCriteriaList([_LoopGuard(prompt_len, max_new_per_row)]),
             )
-            new_tokens = generated[:, enc["input_ids"].shape[1] :]
-            outputs_sorted.extend(tokenizer.batch_decode(new_tokens, skip_special_tokens=True))
+            for row in generated[:, prompt_len:].tolist():
+                # Finished rows are right-padded out to the batch's length.
+                while row and row[-1] == tokenizer.pad_token_id:
+                    row.pop()
+                row, trimmed = _trim_trailing_loop(row)
+                n_loops += trimmed
+                outputs_sorted.append(tokenizer.decode(row, skip_special_tokens=True))
     finally:
         tokenizer.padding_side = prior_padding_side
+    if n_loops:
+        print(f"generate_batch: {n_loops}/{len(prompts)} outputs stopped on a repeat loop (trimmed to one copy)")
 
     outputs = [None] * len(prompts)
     for sorted_pos, original_idx in enumerate(order):
