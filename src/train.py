@@ -514,6 +514,13 @@ def main() -> None:
         # this string field in the installed transformers version -- verified
         # directly, the old kwarg name raises TypeError here.
         train_sampling_strategy="group_by_length",
+        # Trainer's default (True) drops every dataset column the model's
+        # forward() doesn't accept before batches reach PadCollator -- which
+        # silently removes token_weights (only WeightedLossTrainer.compute_loss
+        # consumes it) and crashes the collator with KeyError. Safe to turn
+        # off: `tokenized` only has input_ids/attention_mask/labels(/token_weights)
+        # left by now (see the remove_columns calls above).
+        remove_unused_columns=False,
         report_to=["tensorboard"],
         disable_tqdm=False,
         seed=cfg.seed,
