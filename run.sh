@@ -39,6 +39,9 @@
 #                     OPENROUTER_API_KEY/TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID
 #                     (and HF_TOKEN, checked below for every mode) in .env.
 #
+# Set SKIP_INSTALL=1 (e.g. `SKIP_INSTALL=1 ./run.sh sweep`) to skip every pip
+# install when the active env already has everything installed.
+#
 # Runs inside tmux automatically (session name "run") so a dropped SSH
 # connection doesn't kill a long build/sweep -- reattach with `tmux attach -t run`.
 set -euo pipefail
@@ -84,7 +87,9 @@ if [ -z "${TMUX:-}" ] && [ -z "${RUN_SH_NO_TMUX:-}" ]; then
   fi
   log "Launching inside tmux session 'run' (reattach any time with: tmux attach -t run)"
   ARGS="$(printf '%q ' "$@")"
-  tmux new-session -d -s run "cd '$REPO_DIR' && RUN_SH_NO_TMUX=1 ./run.sh $ARGS; exec bash"
+  # SKIP_INSTALL passed explicitly: a tmux server that's already running
+  # doesn't inherit this shell's environment into new sessions.
+  tmux new-session -d -s run "cd '$REPO_DIR' && RUN_SH_NO_TMUX=1 SKIP_INSTALL='${SKIP_INSTALL:-}' ./run.sh $ARGS; exec bash"
   tmux attach -t run
   exit 0
 fi
@@ -127,17 +132,24 @@ else
   fi
   source .venv/bin/activate
 fi
-pip install -q --upgrade pip
-pip install -q -r requirements.txt
 
-# Optional, best-effort: speeds up Qwen3.5's hybrid SSM/linear-attention
-# layers, used in both training and generation (eval). Without them,
-# transformers falls back to a correct but much slower reference PyTorch
-# path -- not fatal, so unlike requirements.txt above this is allowed to
-# fail without aborting the whole script: these are CUDA/torch-version-
-# sensitive compiled extensions, not guaranteed to build on every image.
-log "Installing optional attention kernels (causal-conv1d, flash-linear-attention)"
-pip install -q causal-conv1d flash-linear-attention || echo "Optional kernel install failed -- continuing without it (correct, just slower)." >&2
+# SKIP_INSTALL=1 skips every pip install below -- for an instance whose env
+# already has everything installed by hand, e.g. `SKIP_INSTALL=1 ./run.sh sweep`.
+if [ -n "${SKIP_INSTALL:-}" ]; then
+  echo "SKIP_INSTALL set -- skipping package installs, using the active env as-is." >&2
+else
+  pip install -q --upgrade pip
+  pip install -q -r requirements.txt
+
+  # Optional, best-effort: speeds up Qwen3.5's hybrid SSM/linear-attention
+  # layers, used in both training and generation (eval). Without them,
+  # transformers falls back to a correct but much slower reference PyTorch
+  # path -- not fatal, so unlike requirements.txt above this is allowed to
+  # fail without aborting the whole script: these are CUDA/torch-version-
+  # sensitive compiled extensions, not guaranteed to build on every image.
+  log "Installing optional attention kernels (causal-conv1d, flash-linear-attention)"
+  pip install -q causal-conv1d flash-linear-attention || echo "Optional kernel install failed -- continuing without it (correct, just slower)." >&2
+fi
 
 # Mid-training test-set generation (TestEvalCallback) allocates/frees many
 # differently-sized KV-cache tensors in the same process as the Trainer,
