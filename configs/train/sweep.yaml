@@ -17,11 +17,13 @@
 #   - train_fraction: 0.5 -- first-pass experiments on half the curated
 #     data, not a data-scaling ablation; only train_fraction changes, eval
 #     stays on the full test set (see checkpoint_max_examples below).
-#   - use_unsloth: true -- see README's "Unsloth". NOT verified end-to-end
-#     in this repo (no CUDA GPU in the environment this was written in) --
-#     this queue doubles as that first real test. lora_init_mode is "fresh"
-#     (the config's default), the one setting Unsloth is known
-#     incompatible with (merge_and_new) -- confirmed it isn't set.
+#   - use_unsloth: false (explicit, same as the default) -- see README's
+#     "Unsloth". Off for this run: (1) its LoRA path targets only the 7
+#     standard projection names, which misses Qwen3.5's linear-attention
+#     modules (in_proj_qkv/in_proj_z/in_proj_a/in_proj_b/out_proj) that the
+#     plain path's "all-linear" covers -- a smaller adapter than earlier
+#     runs, so not comparable to them; (2) WeightedLossTrainer's own loss
+#     has never been run together with Unsloth. Still unverified end-to-end.
 #   - training.eval_steps/save_steps: 500 (up from 100) -- fewer, less
 #     disruptive checkpoint pauses.
 #   - test.checkpoint_max_examples: null -- was 150; now every checkpoint
@@ -76,7 +78,7 @@ jobs:
     config: configs/train/qwen3.5-2b-masked-weighted.yaml
     overrides:
       train_fraction: 0.5
-      use_unsloth: true
+      use_unsloth: false
       training:
         eval_steps: 500
         save_steps: 500

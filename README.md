@@ -1074,7 +1074,15 @@ settings to be aware of, verified by reading rather than executing:
 - `target_modules` uses the explicit 7-name projection list from Unsloth's
   own docs (`q_proj`/`k_proj`/`v_proj`/`o_proj`/`gate_proj`/`up_proj`/
   `down_proj`), not this repo's usual `"all-linear"` shorthand, since
-  Unsloth's `get_peft_model` doesn't accept that shorthand.
+  Unsloth's `get_peft_model` doesn't accept that shorthand. **For Qwen3.5
+  this is a smaller adapter than the plain path's**: its linear-attention
+  layers name their projections `in_proj_qkv`/`in_proj_z`/`in_proj_a`/
+  `in_proj_b`/`out_proj`, which that list misses -- so an Unsloth run isn't
+  directly comparable to a non-Unsloth one. Add those names before relying
+  on it for Qwen3.5.
+- `recoverable_correction_weight != 1.0` (`WeightedLossTrainer`) computes its
+  own loss from full logits, bypassing Unsloth's fused loss -- this
+  combination has never been run.
 
 ## 4. Compare multiple models/configs
 
