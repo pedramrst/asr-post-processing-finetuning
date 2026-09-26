@@ -157,13 +157,18 @@ python src/build_from_config.py --config configs/data/default.yaml
   config's `dataset_id` resolves to for this mode (see below), so the two
   can't disagree about where the curated dataset actually is.
 
-A separate `test` section holds the eval dataset -- see "Uploading the eval
-slices as one Hub dataset" below. Unlike training data there's no
-prebuilt/build toggle (that repo is always prebuilt, by a one-off run of
-`build_eval_dataset.py`, not something `build_from_config.py` drives) --
-just `dataset_id` plus the `entity_row_type`/`typo_row_type` values needed
-to actually use it, since one repo holds both slices distinguished by a
-`row_type` column.
+A separate `eval` section holds the eval dataset -- named `eval`, not
+`test`, on purpose: its `dataset_id` feeds a train config's
+`test.entity_dataset_id`/`typo_dataset_id`, never `test.dataset_id` itself
+(a train config's own, unrelated field -- the main aggregate test set, e.g.
+`ErfanRou/callcc-test-1k`). Two same-named `test.dataset_id` fields meaning
+different things across these two files would be a real footgun, hence the
+different name here. See "Uploading the eval slices as one Hub dataset"
+below. Unlike training data there's no prebuilt/build toggle (that repo is
+always prebuilt, by a one-off run of `build_eval_dataset.py`, not something
+`build_from_config.py` drives) -- just `dataset_id` plus the
+`entity_row_type`/`typo_row_type` values needed to actually use it, since
+one repo holds both slices distinguished by a `row_type` column.
 
 ### Wiring a train config to this file
 
@@ -632,6 +637,19 @@ cost far beyond training itself -- both `qwen3.5-2b.yaml`/`gemma-3-1b-it.yaml`
 set this to `150`. `null` (the default) falls back to `test.max_examples`
 (no separate cap).
 
+`test.checkpoint_eval_main` (default `true`) gates whether the *main* test
+set even runs at checkpoint time at all -- separate from the cap above.
+Setting it `false` skips the main set's per-checkpoint pass entirely
+(baseline and final evals are untouched, always run it uncapped) and leaves
+only the entity/typo eval slices (already run every checkpoint regardless)
+as the per-checkpoint signal. Useful when `checkpoint_max_examples: null`
+(full test set every checkpoint) turns out too slow in practice --
+`configs/train/sweep.yaml`'s queue sets both `checkpoint_max_examples: null`
+and `checkpoint_eval_main: false` together for exactly this reason. "Best
+checkpoint by WER" tracking (below) falls back to the mean of entity/typo WER
+when the main set didn't run that checkpoint, instead of going inert for the
+whole run.
+
 Generation is also the one place `test.batch_size` (default `8`, raised to
 `16` in the two active configs) matters independently of training's own
 batch size -- and unlike a standalone `evaluate.py` CLI run, the
@@ -1011,6 +1029,13 @@ resumed run too. It only exists when `test.dataset_id` is set, and it's a
 full independent copy -- pruning older numbered checkpoints via
 `save_total_limit` never affects it.
 
+When `test.checkpoint_eval_main: false` (above) skips the main test set at
+checkpoint time, this falls back to the unweighted mean of entity/typo WER
+instead -- not size-weighted between them, since both are curated diagnostic
+slices, not a representative sample where population size should matter.
+Baseline and final evals always run the main set regardless, so those two
+points in a run always compare against real `test_wer`.
+
 ### Unsloth
 
 `use_unsloth: true` swaps model loading and LoRA setup over to
@@ -1054,17 +1079,29 @@ settings to be aware of, verified by reading rather than executing:
 
 `configs/train/sweep.yaml` queues several jobs. Each job names its own `config`
 file -- a job that only needs a different `model_id` could reuse
-`configs/train/base.yaml` plus a one-line `overrides`, but every model actually in
-the current queue (`qwen3.5-2b`, `gemma-3-1b-it`) gets its own standalone
-config instead, since each has a different memory footprint and batch size
-tuned for it (see "Notes" for GPU sizing). Each job's `output_dir`,
-TensorBoard dir, and Hub *folder* are auto-namespaced by job name so they
-never collide, even if the job's own config file sets those fields to
+`configs/train/base.yaml` plus a one-line `overrides`, but a job whose model
+has a different memory footprint/batch size gets its own standalone config
+instead (see "Notes" for GPU sizing). An `overrides` block can also apply
+the *same* set of tweaks identically to multiple jobs without duplicating
+them into each job's own config file. The current queue is a single job,
+`qwen3.5-2b-masked-weighted.yaml` (masking + recoverable-correction
+weighting) with `train_fraction`/`use_unsloth`/step-cadence overrides on
+top; the masking-off/masking-only legs were dropped for time and can be
+added back with the same overrides for a clean comparison -- see
+`sweep.yaml`'s own comments. Each job's `output_dir`, TensorBoard dir, and
+Hub *folder* are auto-namespaced by job **name** so they never collide, even
+if the job's own config file (or its `overrides`) sets those fields to
 something else -- `hub.repo_id` is left alone, since every job is meant to
-share the same repo.
+share the same repo. This is also the mechanism that keeps new experiments
+from colliding with a shared repo's existing runs: give the job a name not
+already used as a Hub folder there, don't need to touch `hub.folder`
+directly.
 
-`Qwen3-1.7B` and `gemma-4-E2B-it` aren't in the queue right now (on hold,
-not removed) -- `configs/train/base.yaml` still exists as the single-run template/
+`gemma-3-1b-it` is out of the queue right now -- not on hold for any
+technical reason, Qwen has just been the stronger model so far -- add its
+config back the same way (see `sweep.yaml`'s own comments) if a future
+comparison needs it. `Qwen3-1.7B` and `gemma-4-E2B-it` are separately on
+hold -- `configs/train/base.yaml` still exists as the single-run template/
 example for `Qwen3-1.7B`, and a `gemma-4-E2B-it` config would need its own
 smaller batch size (it's ~5B params on disk, the biggest of the four
 candidates, despite the "E2B" name) before being added back.

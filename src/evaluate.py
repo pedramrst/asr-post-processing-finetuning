@@ -597,65 +597,83 @@ class TestEvalCallback(TrainerCallback):
 
     def on_save(self, args, state, control, **kwargs):
         # This fires on every checkpoint save (potentially hundreds of times
-        # over a long run) -- test_checkpoint_max_examples, when set, keeps
-        # each of those cheap; test_max_examples (the full set, typically) is
-        # reserved for the one-time baseline/final evals in train.py.
-        max_examples = (
-            self.cfg.test_checkpoint_max_examples
-            if self.cfg.test_checkpoint_max_examples is not None
-            else self.cfg.test_max_examples
-        )
-        metrics = run_test_eval(
-            self.model,
-            self.tokenizer,
-            dataset_id=self.cfg.test_dataset_id,
-            input_column=self.cfg.test_input_column,
-            target_column=self.cfg.test_target_column,
-            output_path=str(Path(self.cfg.output_dir) / "test_eval" / "predictions.jsonl"),
-            system_prompt=resolve_system_prompt(self.cfg),
-            split=self.cfg.test_split,
-            max_new_tokens=self.cfg.test_max_new_tokens,
-            batch_size=self.cfg.test_batch_size,
-            max_examples=max_examples,
-            hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
-            repetition_penalty=self.cfg.test_repetition_penalty,
-            no_repeat_ngram_size=self.cfg.test_no_repeat_ngram_size,
-            fix_weight=self.cfg.test_fix_weight,
-            low_signal_corpus_freq=self.low_signal_corpus_freq,
-            low_signal_min_similarity=self.cfg.mask_min_similarity,
-            low_signal_max_common_freq=self.cfg.mask_max_common_freq,
-        )
-
-        checkpoint_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
-        _, best_wer = update_best_checkpoint(self.cfg.output_dir, str(checkpoint_dir), metrics, state.global_step)
-
-        if self.trainer is not None and metrics["wer"] is not None:
-            log_values = {
-                "test_wer": metrics["wer"],
-                "test_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
-                "test_exact_match": metrics["exact_match"],
-                "test_hallucination_rate": metrics["hallucination_rate"],
-                "test_fix_rate": metrics["fix_rate"],
-                "test_preservation_rate": metrics["preservation_rate"],
-                "test_targeted_score": metrics["targeted_score"],
-                "test_fix_rate_lenient": metrics["fix_rate_lenient"],
-                "test_preservation_rate_lenient": metrics["preservation_rate_lenient"],
-                "test_targeted_score_lenient": metrics["targeted_score_lenient"],
-            }
-            if metrics["fix_rate_recoverable"] is not None:
-                log_values["test_fix_rate_recoverable"] = metrics["fix_rate_recoverable"]
-            if best_wer is not None:
-                log_values["test_best_wer"] = best_wer
-            self.trainer.log(log_values)
-
-        run_secondary_eval(
+        # over a long run). Entity/typo run first and unconditionally -- if
+        # test_checkpoint_eval_main is off, best-checkpoint tracking below
+        # falls back to these instead of going inert for the whole run.
+        entity_metrics = run_secondary_eval(
             self.model, self.tokenizer, self.cfg, self.cfg.test_entity_dataset_id,
             "entity", "test_eval_entity", self.trainer, self.low_signal_corpus_freq,
         )
-        run_secondary_eval(
+        typo_metrics = run_secondary_eval(
             self.model, self.tokenizer, self.cfg, self.cfg.test_typo_dataset_id,
             "typo", "test_eval_typo", self.trainer, self.low_signal_corpus_freq,
         )
+
+        # test_checkpoint_eval_main (default True) gates only this per-
+        # checkpoint pass -- baseline/final main-test evals in train.py
+        # always run regardless. test_checkpoint_max_examples, when set,
+        # keeps this cheap; test_max_examples (the full set, typically) is
+        # reserved for the one-time baseline/final evals in train.py.
+        metrics = None
+        log_values: dict = {}
+        if self.cfg.test_checkpoint_eval_main:
+            max_examples = (
+                self.cfg.test_checkpoint_max_examples
+                if self.cfg.test_checkpoint_max_examples is not None
+                else self.cfg.test_max_examples
+            )
+            metrics = run_test_eval(
+                self.model,
+                self.tokenizer,
+                dataset_id=self.cfg.test_dataset_id,
+                input_column=self.cfg.test_input_column,
+                target_column=self.cfg.test_target_column,
+                output_path=str(Path(self.cfg.output_dir) / "test_eval" / "predictions.jsonl"),
+                system_prompt=resolve_system_prompt(self.cfg),
+                split=self.cfg.test_split,
+                max_new_tokens=self.cfg.test_max_new_tokens,
+                batch_size=self.cfg.test_batch_size,
+                max_examples=max_examples,
+                hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
+                repetition_penalty=self.cfg.test_repetition_penalty,
+                no_repeat_ngram_size=self.cfg.test_no_repeat_ngram_size,
+                fix_weight=self.cfg.test_fix_weight,
+                low_signal_corpus_freq=self.low_signal_corpus_freq,
+                low_signal_min_similarity=self.cfg.mask_min_similarity,
+                low_signal_max_common_freq=self.cfg.mask_max_common_freq,
+            )
+            if metrics["wer"] is not None:
+                log_values = {
+                    "test_wer": metrics["wer"],
+                    "test_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
+                    "test_exact_match": metrics["exact_match"],
+                    "test_hallucination_rate": metrics["hallucination_rate"],
+                    "test_fix_rate": metrics["fix_rate"],
+                    "test_preservation_rate": metrics["preservation_rate"],
+                    "test_targeted_score": metrics["targeted_score"],
+                    "test_fix_rate_lenient": metrics["fix_rate_lenient"],
+                    "test_preservation_rate_lenient": metrics["preservation_rate_lenient"],
+                    "test_targeted_score_lenient": metrics["targeted_score_lenient"],
+                }
+                if metrics["fix_rate_recoverable"] is not None:
+                    log_values["test_fix_rate_recoverable"] = metrics["fix_rate_recoverable"]
+
+        # Best-checkpoint tracking (see Config.test_checkpoint_eval_main's
+        # docstring for the fallback's reasoning): prefer the main test
+        # set's WER; when that didn't run this checkpoint, fall back to the
+        # mean of entity/typo WER instead of going inert.
+        best_source = metrics
+        if best_source is None:
+            wers = [m["wer"] for m in (entity_metrics, typo_metrics) if m is not None and m.get("wer") is not None]
+            best_source = {"wer": sum(wers) / len(wers) if wers else None}
+
+        checkpoint_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
+        _, best_wer = update_best_checkpoint(self.cfg.output_dir, str(checkpoint_dir), best_source, state.global_step)
+        if best_wer is not None:
+            log_values["test_best_wer"] = best_wer
+
+        if self.trainer is not None and log_values:
+            self.trainer.log(log_values)
 
 
 def _cli() -> None:

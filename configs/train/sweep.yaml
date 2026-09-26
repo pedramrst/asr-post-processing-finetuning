@@ -3,29 +3,79 @@
 # plus an optional `overrides` on top for quick tweaks without duplicating a
 # whole file. Jobs run one after another on the same GPU.
 #
-# Currently just the two models actually being fine-tuned right now
-# (Qwen3.5-2B and gemma-3-1b-it) -- Qwen3-1.7B and gemma-4-E2B-it are on
-# hold, not removed; add jobs back for them (config: configs/train/base.yaml for
-# Qwen3-1.7B, a new dedicated config for gemma-4-E2B-it -- see its own batch
-# sizing note from the GPU discussion) when/if they're back in scope.
+# Current queue: a single run, qwen3.5-2b-masked-weighted.yaml (low-signal
+# masking + recoverable-correction weighting both on) -- time-constrained, so
+# the masking-off / masking-only legs of the A/B/C are dropped for now. To
+# bring them back, add jobs for configs/train/qwen3.5-2b.yaml and
+# configs/train/qwen3.5-2b-masked.yaml with these SAME overrides, so the
+# comparison stays clean. gemma-3-1b-it is intentionally out of this queue --
+# Qwen has been the stronger model so far; add it back the same way
+# (config: configs/train/gemma-3-1b-it.yaml + these same overrides) if you
+# want it in a future comparison.
 #
-# output_dir/tensorboard.logging_dir/hub.folder are always auto-namespaced
-# per job under output_root -- even if the job's own config file sets them --
-# unless you set them explicitly via that job's `overrides`. This is what
-# keeps results directly comparable (point TensorBoard at output_root to see
-# them all) regardless of what a standalone config file happens to contain.
-# hub.repo_id is NOT touched here -- every job's own config already points at
-# the same shared repo, so both jobs below end up as two folders in one repo.
+# This batch's overrides:
+#   - train_fraction: 0.5 -- first-pass experiments on half the curated
+#     data, not a data-scaling ablation; only train_fraction changes, eval
+#     stays on the full test set (see checkpoint_max_examples below).
+#   - use_unsloth: true -- see README's "Unsloth". NOT verified end-to-end
+#     in this repo (no CUDA GPU in the environment this was written in) --
+#     this queue doubles as that first real test. lora_init_mode is "fresh"
+#     (the config's default), the one setting Unsloth is known
+#     incompatible with (merge_and_new) -- confirmed it isn't set.
+#   - training.eval_steps/save_steps: 500 (up from 100) -- fewer, less
+#     disruptive checkpoint pauses.
+#   - test.checkpoint_max_examples: null -- was 150; now every checkpoint
+#     eval covers the full test set (falls back to test.max_examples, also
+#     null), not just the one-time baseline/final passes. Affordable now
+#     that checkpoints are 5x less frequent (500 vs. 100 steps apart).
+#   - test.checkpoint_eval_main: false -- the *combination* of the previous
+#     point with eval_steps=500 (not 100) turned out not to be the win it
+#     looked like on its own: null checkpoint_max_examples means the main
+#     test set's per-checkpoint pass now runs its FULL ~2,000 rows (not
+#     capped at 150) every checkpoint, which measured slower in practice
+#     than the previous cadence despite firing 5x less often. This skips
+#     the main set at checkpoint time entirely (baseline/final still run it,
+#     uncapped, same as before) and leaves the entity+typo eval (1,010 + 358
+#     rows, already run every checkpoint regardless) as the per-checkpoint
+#     signal -- also a more direct read on this specific comparison, since
+#     it's exactly what masking targets. Best-checkpoint tracking falls back
+#     to the mean of entity/typo WER instead of going inert -- see
+#     Config.test_checkpoint_eval_main's docstring.
 #
-# Generate the data these jobs train on first with:
-#   python src/build_dataset.py --assembled-ratio 0.3 --output-dir ./asr_dataset.jsonl
-#   python src/prepare_split.py --input ./asr_dataset.jsonl --output ./asr_dataset_curated.jsonl
+# dataset_id/test.entity_dataset_id/typo_dataset_id/row types are NOT
+# overridden here -- the config already pull the prebuilt Hub dataset
+# (PedramR/ASR_Post-processing-dataset) and the combined eval repo via
+# data_config: configs/data/default.yaml (see README's "Data config").
+#
+# Hub folder safety: PedramR/ASR_Post-processing (the shared Hub repo the
+# config's hub.repo_id points at) already has real run data under
+# qwen3.5-2b/ and gemma-3-1b-it/ (verified directly via the Hub API before
+# writing this) -- NOT to be overwritten. hub.folder is left unset here on
+# purpose: run_sweep.py auto-namespaces it to each job's own `name` below
+# when not overridden, so this job lands in a new
+# qwen3.5-2b-50pct-masked-weighted/ folder in the same repo instead of
+# colliding with the existing ones. Don't rename this job to "qwen3.5-2b" or
+# "gemma-3-1b-it" without also setting hub.folder explicitly to something
+# that isn't already in the repo.
+#
+# output_dir/tensorboard.logging_dir are also always auto-namespaced per job
+# under output_root, the same way, unless a job's `overrides` sets them.
+#
+# Generate the data this job trains on first if using source: build instead
+# of the prebuilt default -- see README's "Data config":
+#   python src/build_from_config.py --config configs/data/default.yaml
 
-output_root: ./outputs/model-comparison
+output_root: ./outputs/qwen-mask-weighted
 
 jobs:
-  - name: qwen3.5-2b
-    config: configs/train/qwen3.5-2b.yaml
-
-  - name: gemma-3-1b-it
-    config: configs/train/gemma-3-1b-it.yaml
+  - name: qwen3.5-2b-50pct-masked-weighted
+    config: configs/train/qwen3.5-2b-masked-weighted.yaml
+    overrides:
+      train_fraction: 0.5
+      use_unsloth: true
+      training:
+        eval_steps: 500
+        save_steps: 500
+      test:
+        checkpoint_max_examples: null
+        checkpoint_eval_main: false

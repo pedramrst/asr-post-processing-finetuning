@@ -52,6 +52,7 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "batch_size": "test_batch_size",
         "max_examples": "test_max_examples",
         "checkpoint_max_examples": "test_checkpoint_max_examples",
+        "checkpoint_eval_main": "test_checkpoint_eval_main",
         "hallucination_overlap_floor": "test_hallucination_overlap_floor",
         "repetition_penalty": "test_repetition_penalty",
         "no_repeat_ngram_size": "test_no_repeat_ngram_size",
@@ -251,6 +252,26 @@ class Config:
     # multiplies eval cost far beyond training itself. null falls back to
     # test_max_examples (i.e. no separate cap).
     test_checkpoint_max_examples: int | None = None
+    # Whether TestEvalCallback's per-checkpoint pass includes the main test
+    # set (test_dataset_id) at all -- baseline/final main-test evals in
+    # train.py are unaffected either way. True (the default) is the
+    # long-standing behavior. Set False to skip it at every checkpoint and
+    # rely on the entity/typo evals below instead -- useful when the main
+    # set is the dominant per-checkpoint eval cost, e.g. once
+    # test_checkpoint_max_examples is null too (the main set's per-checkpoint
+    # pass then runs the *full*, often much larger, test set every single
+    # checkpoint, not just at baseline/final).
+    #
+    # "Best checkpoint by WER" (see README) normally tracks the main test
+    # set's per-checkpoint WER -- with this off, there's no such WER to
+    # track, so it falls back to the mean of test_entity_dataset_id's and
+    # test_typo_dataset_id's WER instead (whichever of the two are set; not
+    # size-weighted between them, since both are curated diagnostic slices,
+    # not a representative sample where population size should matter). If
+    # neither entity nor typo dataset is set either, best-checkpoint
+    # tracking goes inert during training -- only baseline vs. final ever
+    # get compared, since those still run the main set unconditionally.
+    test_checkpoint_eval_main: bool = True
     # A prediction is flagged "hallucinated" (predictions.jsonl + the
     # test_hallucination_rate TensorBoard curve) when under this % of its
     # words appear anywhere in the input -- i.e. the model said things the
@@ -390,9 +411,15 @@ def _resolve_data_config(path: str) -> dict[str, Any]:
     disagree about where the dataset actually landed.
 
     test_entity_dataset_id/test_typo_dataset_id/test_entity_row_type/
-    test_typo_row_type come from the data config's `test` section (see
-    configs/data/default.yaml) -- both dataset_id fields get the same repo
-    id, since that section describes one combined eval repo, not two.
+    test_typo_row_type come from the data config's `eval` section (see
+    configs/data/default.yaml) -- named `eval`, not `test`, on purpose: its
+    dataset_id feeds the *train* config's test.entity_dataset_id/
+    typo_dataset_id, never test.dataset_id itself (the main aggregate test
+    set, a different, unrelated field a train config sets directly) -- two
+    same-named test.dataset_id fields meaning different things would be
+    confusing regardless of which file each one is in. Both
+    test_entity_dataset_id/test_typo_dataset_id get the same repo id here,
+    since eval describes one combined eval repo, not two.
     """
     data_raw = yaml.safe_load(Path(path).read_text()) or {}
     resolved: dict[str, Any] = {}
@@ -407,14 +434,14 @@ def _resolve_data_config(path: str) -> dict[str, Any]:
     if dataset_id:
         resolved["dataset_id"] = dataset_id
 
-    test_cfg = data_raw.get("test") or {}
-    if test_cfg.get("dataset_id"):
-        resolved["test_entity_dataset_id"] = test_cfg["dataset_id"]
-        resolved["test_typo_dataset_id"] = test_cfg["dataset_id"]
-    if test_cfg.get("entity_row_type"):
-        resolved["test_entity_row_type"] = test_cfg["entity_row_type"]
-    if test_cfg.get("typo_row_type"):
-        resolved["test_typo_row_type"] = test_cfg["typo_row_type"]
+    eval_cfg = data_raw.get("eval") or {}
+    if eval_cfg.get("dataset_id"):
+        resolved["test_entity_dataset_id"] = eval_cfg["dataset_id"]
+        resolved["test_typo_dataset_id"] = eval_cfg["dataset_id"]
+    if eval_cfg.get("entity_row_type"):
+        resolved["test_entity_row_type"] = eval_cfg["entity_row_type"]
+    if eval_cfg.get("typo_row_type"):
+        resolved["test_typo_row_type"] = eval_cfg["typo_row_type"]
     return resolved
 
 

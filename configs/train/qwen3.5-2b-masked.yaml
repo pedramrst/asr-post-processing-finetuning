@@ -99,7 +99,7 @@ test:
   # if the trend signal is too noisy or still too slow.
   checkpoint_max_examples: 150
   # entity_dataset_id/entity_row_type/typo_dataset_id/typo_row_type come
-  # from data_config above (configs/data/default.yaml's `test` section) --
+  # from data_config above (configs/data/default.yaml's `eval` section) --
   # see README's "Named-entity eval slice"/"Uploading the eval slices as
   # one Hub dataset".
   # Weight on fix_rate vs. preservation_rate in targeted_score -- see

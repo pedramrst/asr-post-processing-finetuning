@@ -49,14 +49,22 @@ build:
     seed: 42
 
 # Eval dataset -- see README's "Uploading the eval slices as one Hub
-# dataset". Unlike the training dataset above, there's no source:
-# prebuilt/build toggle here: this repo is always prebuilt (built by
+# dataset". Named `eval`, deliberately NOT `test` -- a train config's own
+# `test` section has its own, different `dataset_id` (the main aggregate
+# test set, e.g. ErfanRou/callcc-test-1k); this section's dataset_id feeds
+# that config's test.entity_dataset_id/typo_dataset_id instead (see
+# config.py's _resolve_data_config()), never test.dataset_id itself -- two
+# same-named `test.dataset_id` fields meaning different things would be a
+# real footgun, so this one gets a different name instead.
+#
+# Unlike the training dataset above, there's no source: prebuilt/build
+# toggle here: this repo is always prebuilt (built by
 # src/build_eval_dataset.py, a separate one-off step, not something
 # build_from_config.py drives). A bare dataset_id isn't enough to use it on
 # its own, though -- entity_row_type/typo_row_type are the "arguments"
 # needed to actually select the right rows, since one repo holds both
 # slices distinguished by a `row_type` column.
-test:
+eval:
   dataset_id: PedramR/ASR_Post-processing-eval
   entity_row_type: entity
   typo_row_type: typo
