@@ -394,11 +394,6 @@ def main() -> None:
     if cfg.train_fraction is not None and cfg.train_fraction < 1.0:
         print(f"train_fraction={cfg.train_fraction}: using {len(raw['train'])} train rows")
 
-    length_stats = Counter()
-    masked_low_signal_tokens_total = 0
-    masked_low_signal_examples = 0
-    weighted_recoverable_tokens_total = 0
-    weighted_recoverable_examples = 0
     system_prompt = resolve_system_prompt(cfg)
 
     # Word frequencies over the training targets. Used by three separate
@@ -425,7 +420,7 @@ def main() -> None:
     word_category_corpus_freq = corpus_freq if uses_word_categories else None
 
     def _map(example):
-        result = build_example(
+        return build_example(
             tokenizer,
             example[cfg.input_column],
             example[cfg.target_column],
@@ -438,18 +433,24 @@ def main() -> None:
             mask_max_common_freq=cfg.mask_max_common_freq,
             recoverable_correction_weight=cfg.recoverable_correction_weight,
         )
-        length_stats[result["status"]] += 1
-        nonlocal masked_low_signal_tokens_total, masked_low_signal_examples
-        nonlocal weighted_recoverable_tokens_total, weighted_recoverable_examples
-        if result["masked_low_signal_tokens"]:
-            masked_low_signal_tokens_total += result["masked_low_signal_tokens"]
-            masked_low_signal_examples += 1
-        if result["weighted_recoverable_tokens"]:
-            weighted_recoverable_tokens_total += result["weighted_recoverable_tokens"]
-            weighted_recoverable_examples += 1
-        return result
 
     tokenized = raw.map(_map, remove_columns=raw["train"].column_names)
+
+    # Stats read back from the mapped columns, not counted inside _map():
+    # datasets.map() reuses a cached result when the same map already ran
+    # (e.g. a rerun of the same command), skipping _map entirely -- counters
+    # incremented there would then all read 0 even though the data is fine.
+    length_stats = Counter()
+    masked_low_signal_tokens_total = masked_low_signal_examples = 0
+    weighted_recoverable_tokens_total = weighted_recoverable_examples = 0
+    for split_ds in tokenized.values():
+        length_stats.update(split_ds["status"])
+        masked = split_ds["masked_low_signal_tokens"]
+        masked_low_signal_tokens_total += sum(masked)
+        masked_low_signal_examples += sum(1 for n in masked if n)
+        weighted = split_ds["weighted_recoverable_tokens"]
+        weighted_recoverable_tokens_total += sum(weighted)
+        weighted_recoverable_examples += sum(1 for n in weighted if n)
 
     n_total = sum(length_stats.values())
     print(
