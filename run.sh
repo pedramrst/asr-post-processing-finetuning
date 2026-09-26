@@ -24,13 +24,13 @@
 #                     works). Anything after <config> is forwarded to
 #                     train.py, e.g. `./run.sh train qwen3.5-2b --set
 #                     train_fraction=0.1 --set output_dir=./outputs/qwen-10pct`
-#                     for a data-scaling ablation run. Assumes the full
-#                     dataset was already built (run `build` first). Unlike
+#                     for a data-scaling ablation run. If DATA_CONFIG has
+#                     source: build, run `build` first; with source:
+#                     prebuilt (the default), no build step needed. Unlike
 #                     `sweep`, output_dir/hub.folder come straight from that
 #                     config file, not auto-namespaced.
 #   ./run.sh sweep    Run the model comparison (configs/train/sweep.yaml).
-#                     Assumes the full dataset was already built (run `build`
-#                     first).
+#                     Same `build` requirement as `train`.
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
 #                     run `smoke` first if you haven't already.
 #   ./run.sh agent    Start the Telegram + LLM tool-calling operations agent
@@ -186,11 +186,20 @@ run_smoke() {
   log "Smoke test complete -- check outputs/smoke-test/ and the 'smoke-test' folder in your Hub repo."
 }
 
-run_sweep() {
-  if [ ! -f ./asr_dataset_curated.jsonl ]; then
-    echo "./asr_dataset_curated.jsonl not found -- run './run.sh build' first." >&2
+# The local curated file only matters when $DATA_CONFIG builds the dataset
+# (source: build) -- with source: prebuilt, training pulls it from the Hub
+# instead, so a fresh clone shouldn't need a `build` first.
+require_built_data() {
+  local source
+  source="$(python -c "import sys, yaml; print((yaml.safe_load(open(sys.argv[1])) or {}).get('source', 'build'))" "$DATA_CONFIG")"
+  if [ "$source" = "build" ] && [ ! -f ./asr_dataset_curated.jsonl ]; then
+    echo "./asr_dataset_curated.jsonl not found and $DATA_CONFIG has source: build -- run './run.sh build' first." >&2
     exit 1
   fi
+}
+
+run_sweep() {
+  require_built_data
   log "Running model comparison sweep (configs/train/sweep.yaml)"
   python src/run_sweep.py --sweep configs/train/sweep.yaml
 }
@@ -231,10 +240,7 @@ run_train() {
     ls configs/train/*.yaml | sed 's/^/  /' >&2
     exit 1
   fi
-  if [ ! -f ./asr_dataset_curated.jsonl ]; then
-    echo "./asr_dataset_curated.jsonl not found -- run './run.sh build' first." >&2
-    exit 1
-  fi
+  require_built_data
   log "Training $config_path"
   python src/train.py --config "$config_path" "$@"
 }

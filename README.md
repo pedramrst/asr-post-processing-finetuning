@@ -47,9 +47,10 @@ dropped SSH connection doesn't kill a multi-hour run:
                                # exercises train/save/hub-sync/test-eval/WER cheaply before
                                # committing to a real run. Do this first.
 ./run.sh build                 # (re)build + curate the full training dataset
-./run.sh train qwen3.5-2b      # train just one config -- needs `build` first (see below)
+./run.sh train qwen3.5-2b      # train just one config -- needs `build` first only if the data
+                               # config has source: build (not the prebuilt default)
 ./run.sh train gemma-3-1b-it   # same, for the other config
-./run.sh sweep                 # the model comparison (configs/train/sweep.yaml) -- needs `build` first
+./run.sh sweep                 # the model comparison (configs/train/sweep.yaml) -- same `build` rule
 ./run.sh full                  # build + sweep back to back -- multi-hour, real GPU cost
 ```
 
@@ -1273,6 +1274,10 @@ original sweep entry's results in place) -- routed through the same
 supervisor, so it gets the same crash recovery as any other run. Explicitly
 guards against an all-failed sweep (the ranking's `sorted(...)[0]` would
 otherwise still return a job even when every `test_wer` is `None`).
+
+Set `followup: false` at the top level of the sweep YAML to skip this
+entirely -- the current `configs/train/sweep.yaml` does, since with a
+single job the "winner" is just that job.
 
 ### Caveats
 

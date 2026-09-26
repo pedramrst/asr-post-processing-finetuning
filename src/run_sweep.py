@@ -206,6 +206,12 @@ def main() -> None:
     # all-failed sweep explicitly: sorted(...)[0] still returns a job even
     # when every test_wer is None (the sort key just pushes None last, it
     # doesn't exclude it), so this must check for a real winner first.
+    # `followup: false` at the sweep YAML's top level turns this off
+    # entirely -- e.g. a single-job queue, where the "winner" is just that
+    # one job and a follow-up would only burn extra GPU time.
+    if not sweep.get("followup", True):
+        send_telegram_message("Sweep finished (followup: false -- not launching a follow-up run).")
+        return
     winner = sorted(results, key=lambda r: (r["test_wer"] is None, r["test_wer"], r["best_eval_loss"] is None, r["best_eval_loss"]))[0]
     if winner["test_wer"] is None:
         send_telegram_message("Sweep finished with no successful jobs (no test_wer recorded) -- skipping follow-up.")

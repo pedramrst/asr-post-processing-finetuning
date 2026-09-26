@@ -66,6 +66,10 @@
 #   python src/build_from_config.py --config configs/data/default.yaml
 
 output_root: ./outputs/qwen-mask-weighted
+# Don't auto-launch a longer follow-up run of the sweep's winner (see
+# README's "Sweeps auto-continue their winner") -- with a single job the
+# "winner" is just that job, and there's no time budget for more.
+followup: false
 
 jobs:
   - name: qwen3.5-2b-50pct-masked-weighted
