@@ -698,12 +698,13 @@ def _cli() -> None:
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--hallucination_overlap_floor", type=float, default=50.0,
                     help="Flag a prediction as hallucinated when under this %% of its words appear in the input.")
-    p.add_argument("--repetition_penalty", type=float, default=1.2,
-                    help="Penalizes repeated tokens during greedy decoding -- mitigates runaway repeat loops "
-                         "(e.g. this task's short natural agreement-word bursts spiraling into hundreds of "
-                         "repeats). 1.0 disables it.")
-    p.add_argument("--no_repeat_ngram_size", type=int, default=3,
-                    help="Hard-blocks repeating any n-gram of this size that's already appeared. 0 disables it.")
+    p.add_argument("--repetition_penalty", type=float, default=1.0,
+                    help="Penalizes repeated tokens during greedy decoding. 1.0 (default) disables it. Applies "
+                         "to the prompt too, i.e. the input transcript -- anything above 1.0 discourages copying "
+                         "the input (see Config.test_repetition_penalty).")
+    p.add_argument("--no_repeat_ngram_size", type=int, default=0,
+                    help="Hard-blocks repeating any n-gram of this size already in the sequence, prompt "
+                         "included -- so it forbids copying the input's n-grams. 0 (default) disables it.")
     args = p.parse_args()
 
     import torch as _torch

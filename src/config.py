@@ -288,8 +288,18 @@ class Config:
     # outputs on this task's fine-tuned checkpoints degenerated this way,
     # tanking wer/hallucination_rate on otherwise-good predictions. These
     # are the standard mitigation; 1.0/0 disables each respectively.
-    test_repetition_penalty: float = 1.2
-    test_no_repeat_ngram_size: int = 3
+    #
+    # Both OFF by default: for a decoder-only model, generate() applies them
+    # to the whole sequence *including the prompt*, which here contains the
+    # very transcript to be corrected -- no_repeat_ngram_size bans every
+    # 3-token sequence already in the input, and repetition_penalty
+    # down-weights every input token, so the model is forbidden from copying
+    # its input and writes fluent invented text instead (observed: ~100%
+    # hallucination_rate at baseline and every checkpoint, even though the
+    # same untrained model copies near-perfectly with both off). Don't turn
+    # either back on without restricting it to generated tokens only.
+    test_repetition_penalty: float = 1.0
+    test_no_repeat_ngram_size: int = 0
     # Runs one extra test-set eval before the first training step (LoRA's
     # B matrix is zero-initialized, so the freshly-wrapped, untrained model
     # is numerically identical to the plain base model here) -- saved

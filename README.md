@@ -616,8 +616,19 @@ triggers a generation pass over that dataset: the model corrects each
   `test_fix_rate_recoverable`, so you get curves over training steps, not
   just final numbers.
 
-`test.repetition_penalty` (default `1.2`) and `test.no_repeat_ngram_size`
-(default `3`) guard against a real, observed failure of plain greedy
+`test.repetition_penalty` and `test.no_repeat_ngram_size` are **off by
+default** (`1.0`/`0`). For a decoder-only model, `generate()` applies both
+to the whole sequence *including the prompt* -- which contains the very
+transcript being corrected -- so `no_repeat_ngram_size: 3` bans every
+3-token sequence already in the input and `repetition_penalty: 1.2`
+down-weights every input token. The model is then forbidden from copying
+its input and writes fluent invented text: with the old `1.2`/`3` defaults,
+`hallucination_rate` read ~1.0 at baseline and at every checkpoint, while
+the same untrained model with both off copied short and 500-word inputs
+near-perfectly. Don't turn either back on without restricting it to
+generated tokens only.
+
+They were originally added to guard against a real, observed failure of plain greedy
 decoding (`do_sample=False`): a short, locally-high-probability phrase --
 e.g. this task's "بله" (yes) agreement-word bursts, which do occur
 naturally as short runs in real training segments -- can trigger a runaway
@@ -626,7 +637,8 @@ repeat loop that never finds the actual stopping point and just fills
 roughly 1 in 6-7 test examples and single-handedly dragged the aggregate
 `wer`/`hallucination_rate` far worse than the untrained baseline, even
 though the ~85% of predictions that didn't degenerate were good corrections.
-Set either to `1.0`/`0` to disable.
+With both off, that failure can come back; `test.max_new_tokens` is what
+bounds it.
 
 `test.max_examples` caps the *baseline* (below) and *final* evals -- each
 only runs once per training run, so leaving it `null` (the full test set) is
