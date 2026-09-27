@@ -28,6 +28,7 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "gradient_accumulation_steps",
         "learning_rate",
         "warmup_ratio",
+        "lr_scheduler_type",
         "logging_steps",
         "eval_steps",
         "save_steps",
@@ -165,6 +166,10 @@ class Config:
     gradient_accumulation_steps: int = 4
     learning_rate: float = 2e-4
     warmup_ratio: float = 0.03
+    # Passed straight through to TrainingArguments (e.g. "linear", "cosine",
+    # "constant_with_warmup"). "linear" is transformers' own default, and
+    # what every run before this field existed actually used.
+    lr_scheduler_type: str = "linear"
     logging_steps: int = 10
     eval_steps: int = 200
     save_steps: int = 200

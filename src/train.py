@@ -493,6 +493,7 @@ def main() -> None:
         # `warmup_ratio` was folded into `warmup_steps` (float < 1 == ratio) in this
         # transformers version; kept as `warmup_ratio` in our own config for clarity.
         warmup_steps=cfg.warmup_ratio,
+        lr_scheduler_type=cfg.lr_scheduler_type,
         logging_steps=cfg.logging_steps,
         eval_strategy="steps" if has_eval else "no",
         eval_steps=cfg.eval_steps if has_eval else None,
