@@ -56,12 +56,13 @@ from dotenv import load_dotenv  # noqa: E402
 from huggingface_hub import hf_hub_download  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 
+from corpus import load_corpus_freq  # noqa: E402
 from edits import Edit, apply_edits, extract_edits, validate_edits  # noqa: E402
 from evaluate import _load_hub_columns_pruned  # noqa: E402
 from grounding import (  # noqa: E402
     crm_candidates, crm_snap_edits, load_gemini_entities, reference_entity_spans, span_similarity,
 )
-from persian_normalize import normalize_lenient, words_equivalent  # noqa: E402
+from normalize import is_style_edit, strip_punctuation  # noqa: E402
 from rules import rule_edits  # noqa: E402
 from scoring import lenient_positions, score  # noqa: E402
 
@@ -101,49 +102,6 @@ def parse_args():
     p.add_argument("--entities-dir", default="data/output-backup")
     p.add_argument("--output-dir", default="outputs/edit/diff_filter_baseline")
     return p.parse_args()
-
-
-def load_corpus_freq(train_repo: str, train_fraction: float | None, seed: int, cache_dir: Path) -> Counter:
-    """Word frequencies over the run's own training targets -- the same
-    Counter train.py builds, including its train_fraction subsample
-    (data.load_sft_dataset's shuffle(seed).select(n), which depends only on
-    the seed and row count, so a text-only load gives the same subset)."""
-    cache = cache_dir / f"corpus_freq_{train_fraction or 1.0}_{seed}.json"
-    if cache.exists():
-        return Counter(json.loads(cache.read_text(encoding="utf-8")))
-    print(f"Counting word frequencies over {train_repo} (fraction={train_fraction}, cached to {cache})...")
-    ds = _load_hub_columns_pruned(train_repo, ["text"], "train")
-    if train_fraction is not None and train_fraction < 1.0:
-        ds = ds.shuffle(seed=seed).select(range(round(len(ds) * train_fraction)))
-    freq = Counter()
-    for text in ds["text"]:
-        freq.update(text.split())
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(freq, ensure_ascii=False), encoding="utf-8")
-    return freq
-
-
-# Neither Whisper's output nor the `text` reference is punctuated, but a
-# rewrite model often adds sentence punctuation ("کنم" -> "کنم.") -- every
-# such edit reads as a broken word and sounds identical, so it would pass the
-# phonetic filter. Stripped from the model output before extracting edits;
-# "-" and "/" are kept since they occur inside model numbers/codes.
-_PUNCT = str.maketrans("", "", ".,،؛;:!?؟«»\"“”()[]…")
-
-
-def strip_punctuation(text: str) -> str:
-    return " ".join(w for w in text.translate(_PUNCT).split() if w)
-
-
-def is_style_edit(e: Edit) -> bool:
-    """Only a spelling/spacing/dialect variant, not a different word."""
-    a, b = " ".join(e.original), " ".join(e.replacement)
-    if a.replace(" ", "").replace("‌", "") == b.replace(" ", "").replace("‌", ""):
-        return True
-    if normalize_lenient(a) == normalize_lenient(b):
-        return True
-    return len(e.original) == len(e.replacement) and all(
-        words_equivalent(x, y) for x, y in zip(e.original, e.replacement))
 
 
 def annotate(e: Edit, candidates: set[str]) -> Edit:
@@ -290,7 +248,7 @@ def main():
     out_root = Path(args.output_dir)
     run_cfg = yaml.safe_load(Path(hf_hub_download(args.hub_repo, f"{args.run}/resolved_config.yaml")).read_text())
     corpus_freq = load_corpus_freq(args.train_repo, run_cfg.get("train_fraction"),
-                                   (run_cfg.get("training") or {}).get("seed", 42), Path("outputs/edit/cache"))
+                                   (run_cfg.get("training") or {}).get("seed", 42))
     test = _load_hub_columns_pruned(args.test_repo, ["call_id", "text_whisper", "crm_metadata"], "test")
     test_by_whisper = {r["text_whisper"]: r for r in test if r["text_whisper"]}
     gemini = load_gemini_entities(args.entities_dir) if Path(args.entities_dir).exists() else {}

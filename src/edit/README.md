@@ -80,17 +80,79 @@ What it showed:
    no product/brand catalog, so products/brands are evaluated (via Gemini
    labels) but not yet grounded.
 
+## Step 2: clean training targets (in progress)
+
+Soniox's `text` is itself ASR output, so its differences from Whisper are
+checked one at a time before any of them become correction targets.
+
+```bash
+python3 src/edit/build_diffs.py --max-rows 5000   # rows -> differences (outputs/edit/targets/)
+python3 src/edit/make_label_sheet.py              # 200-item calibration sample + labelling page
+open outputs/edit/targets/label_calibration.html  # label by hand, Export -> calibration_labels.json
+python3 src/edit/llm_judge.py --items outputs/edit/targets/calibration_items.jsonl
+python3 src/edit/calibrate.py                     # judge vs hand labels -> calibration_report.md
+```
+
+- `build_diffs.py` applies `rules.py` first, aligns Whisper against Soniox,
+  marks style-only differences (not judged), and sorts the rest into
+  strata: `entity`, `phonetic_sub`, `other_sub`, `whisper_dropped`,
+  `whisper_extra`, `long`. On a 5,000-row sample: 88k differences, 73.5k
+  not style-only (about 15 per row), so judging the full 114k-row corpus
+  isn't practical. Rows get selected first.
+- `llm_judge.py` shows each difference **blind**: the two versions as A/B
+  in a per-item random order, so neither a judge nor the person labelling
+  knows which is Soniox. Verdicts map to `real_error` (Soniox right),
+  `soniox_wrong`, `style_variant`, `both_wrong`, `uncertain`. Each model
+  runs as `@think` (reasoning on) and `@nothink`; results are cached per
+  variant in `outputs/edit/judge/`.
+- Which judge to trust is decided by `calibrate.py` against the hand
+  labels, mainly by **real_error precision** (a wrong target teaches
+  over-editing; a missed one just leaves Whisper's text).
+
+### Hand-labelling round 1 and what changed
+
+The first 200 items were often undecidable from text, and the prompt v1 /
+page had no answer for "both are fine". The person used "same" for that
+(filler words, small variants that both fit), while the judges read "same"
+as spelling-only and forced an A/B choice. Judges' real_error precision was
+57–65%. Changes:
+
+- `build_diffs.py` now splits spans mixing a style-only and a real
+  difference (`نمونه‌پور بله یه` vs `نمونه پور`), and never judges `filler`
+  (only filler words on both sides) or `garbled` (2+ other differences
+  within 3 words, so the context is unreadable). Check against the round-1
+  labels: filler items were 14/21 "doesn't matter", style 9/10; the few
+  real errors dropped just stay Whisper's text.
+- Prompt v2: A/B only when one version is clearly right and the other
+  clearly wrong; new `either` verdict for "both acceptable"; the context is
+  flagged as possibly wrong itself. The page has the same options plus a
+  separate note field.
+- `make_label_sheet.py --refresh` re-maps labelled items onto a rebuilt
+  `diffs.jsonl` (139 of 200 kept their labels); `--review` builds a page
+  with only the items where the judges agree with each other but not with
+  the person, plus unlabelled split pieces.
+
+Prompt v2 on the 139 still-judged, hand-labelled items:
+
+| rule for "real error" | precision | recall |
+|---|---|---|
+| DeepSeek@think (v1 prompt) | 65% | 92% |
+| DeepSeek@think | 84% | 86% |
+| MiMo@think | 92% | 54% |
+| **DeepSeek@think, unless MiMo@think says either/Soniox wrong** | **93%** | **67%** |
+| both say real error | 97% | 52% |
+
+`@nothink` variants became much more conservative under v2 (recall
+41–44%) and are dropped. DeepSeek@think fails to answer within 8k tokens
+on about 11% of items (they stay Whisper's text). Cost: about $0.0016 per
+item for DeepSeek@think and $0.00014 for MiMo@think.
+
+Still to do in this step: the review round (`label_review.html`), then
+select a small, informative training set (entity/CRM rows, sound-alike
+substitutions, plenty of no-edit rows) and run the chosen judges on it.
+
 ## Next steps
 
-2. **Clean training targets.** Align Whisper vs Soniox, normalize with
-   `persian_normalize`, drop what `rules.py` already fixes, then have cheap
-   LLMs (via OpenRouter) classify each remaining difference as
-   `real_error` / `style_variant` / `soniox_wrong` / `uncertain`, with CRM
-   names as evidence. Keep an edit as a target only when the judges agree
-   it's `real_error`. Validate the judges on ~150–200 hand-labelled
-   differences first. Select a small, informative set (entity/CRM rows,
-   phonetically close substitutions, plenty of no-edit rows) instead of the
-   full corpus. The same judged labels also give a cleaner eval reference.
 3. **Train the edit model** on word-indexed input (`[1]word [2]word …`)
    with a compact output (`3-4 → replacement`, or `NONE`), applied after
    `rules.py`. Compare against `whisper`, `rules`, and the rewrite runs.
