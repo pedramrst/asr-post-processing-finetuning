@@ -88,9 +88,19 @@ short_target_eos_weight: 0.3
 short_target_max_words: 20
 
 training:
-  # 2, not 3 -- see base.yaml's comment: extra epochs risk overfitting,
-  # compounded by prepare_split.py's row upsampling.
-  num_train_epochs: 2.0
+  # 1.0, down from 2.0 -- paired with sweep.yaml's train_fraction: 1.0 (was
+  # 0.5), which keeps the row-passes and wall-clock identical (~177k either
+  # way) while making every example unique instead of seen twice. The first
+  # pass's TensorBoard logs showed the cost of that second pass directly:
+  # train/loss fell the whole run while eval WER peaked at step 2000 (0.36
+  # epochs) and never recovered, and loss dropped 11.3% discontinuously at
+  # the epoch-2 boundary vs. 2.4% for a mid-epoch control -- memorization,
+  # not learning. A single epoch also lets the linear LR schedule actually
+  # anneal within the window where the model is still improving: at the
+  # first pass's own optimum the LR was still 86% of peak, i.e. the best
+  # checkpoint was taken at nearly full learning rate and never annealed.
+  # See sweep.yaml's train_fraction note for the corpus_freq side effect.
+  num_train_epochs: 1.0
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 16
@@ -104,11 +114,17 @@ training:
   # Stops the run once the best-checkpoint WER (see README's "best checkpoint
   # by WER", update_best_checkpoint()) hasn't improved for this many
   # consecutive checkpoint saves. The qwen3.5-2b-50pct-masked-weighted run
-  # (best_wer=0.223 at step 2000 of 11146, weight=1.0's) never improved on
-  # that again across the remaining 9 checkpoints -- a patience this low
-  # would have stopped that run ~8000 steps earlier. In checkpoint-cadence
-  # terms, not steps: with sweep.yaml's save_steps=1000 override, patience=3
-  # means stopping after 3000 steps without a new best.
+  # (best_wer=0.223 at step 2000 of 11146) never improved on that again
+  # across the remaining 9 checkpoints -- a patience this low would have
+  # stopped that run ~8000 steps earlier.
+  #
+  # Counted in CHECKPOINTS, not steps, so it's coupled to save_steps: with
+  # sweep.yaml's save_steps=500 override, patience=3 means stopping after
+  # 1,500 steps without a new best. Sized against where the optimum is
+  # expected here (~step 1000, i.e. the first pass's step-2000 optimum
+  # halved by the effective-batch change), leaving room for it to land a
+  # couple of checkpoints later than that without being cut off early.
+  # Revisit this number whenever save_steps changes.
   early_stopping_patience: 3
 
 lora:

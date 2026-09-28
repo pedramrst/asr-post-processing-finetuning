@@ -14,9 +14,27 @@
 # want it in a future comparison.
 #
 # This batch's overrides:
-#   - train_fraction: 0.5 -- first-pass experiments on half the curated
-#     data, not a data-scaling ablation; only train_fraction changes, eval
-#     stays on the full test set (see checkpoint_max_examples below).
+#   - train_fraction: 1.0 (was 0.5) -- paired with num_train_epochs 1.0 (was
+#     2.0) in qwen3.5-2b-masked-weighted.yaml. These two cancel out exactly:
+#     0.5 x 2 epochs and 1.0 x 1 epoch both process ~177,076 row-passes, so
+#     wall-clock is unchanged, but every example is now seen ONCE instead of
+#     twice. Motivated by direct evidence from the first pass's TensorBoard
+#     logs (qwen3.5-2b-50pct-masked-weighted): train/loss fell monotonically
+#     the whole run (1.177 -> 0.610) while eval WER peaked at step 2000
+#     (0.36 epochs) and never improved across the remaining 9 checkpoints --
+#     and loss dropped 11.3% *discontinuously* at the epoch-2 boundary
+#     (step 5573) vs. 2.4% for a same-width mid-epoch control, the standard
+#     signature of the model recognizing examples it has already seen.
+#     Removing the second pass removes that memorization mechanism at zero
+#     compute cost.
+#
+#     One real side effect: corpus_freq (train.py builds it over the *train
+#     split's* targets) is now counted over ~184k rows instead of ~92k, so
+#     mask_max_common_freq: 1 -- "occurs at most once in the whole training
+#     set" -- admits slightly fewer words as rare. Masking and
+#     recoverable-correction weighting both get marginally less aggressive,
+#     and fix_rate_recoverable's denominator shifts with them. Small, but a
+#     genuine confound when comparing this run against the 50% one.
 #   - use_unsloth: false (explicit, same as the default) -- see README's
 #     "Unsloth". Off for this run: (1) its LoRA path targets only the 7
 #     standard projection names, which misses Qwen3.5's linear-attention
@@ -24,16 +42,32 @@
 #     plain path's "all-linear" covers -- a smaller adapter than earlier
 #     runs, so not comparable to them; (2) WeightedLossTrainer's own loss
 #     has never been run together with Unsloth. Still unverified end-to-end.
-#   - training.eval_steps/save_steps: 1000 (up from 100, then 500) -- the
-#     run is ~11,000 steps (50% of ~184k rows, ~3.7% dropped as too long,
-#     2 epochs at effective batch 16), so ~11 checkpoints. Each one runs the
-#     full entity+typo eval, so this roughly halves eval time vs. 500, while
-#     keeping enough checkpoints to catch an early best one (the 1% smoke
-#     run's best WER came early, before repeat loops grew) and capping
-#     what a crash loses to ~1h of training. save_steps is what actually
-#     triggers the eval -- eval_steps does nothing here (no validation
-#     split with a Hub dataset and eval_split: null), kept equal for
-#     consistency.
+#   - training.eval_steps/save_steps: 500 (back down from 1000) -- 1000 was
+#     calibrated for the first pass's ~11,000 optimizer steps at effective
+#     batch 16. At effective batch 32 (gradient_accumulation_steps: 16, see
+#     qwen3.5-2b-masked-weighted.yaml) and 1 epoch over the full corpus, this
+#     run is only ~5,530 steps, so 1000 would give ~5 checkpoints total --
+#     and the first pass's optimum, step 2000 of 11,146, maps to ~step 1000
+#     here, i.e. checkpoint #1. Far too coarse to locate an optimum sitting
+#     that early. 500 gives ~11 checkpoints instead.
+#
+#     Cost, measured from the first pass's own wall-clock rather than
+#     estimated: each checkpoint's entity+typo eval took ~35 min, and eval
+#     was 5.9h of that run's 16.7h total (35%). ~11 checkpoints here keeps
+#     the eval burden the same as before. Note test.checkpoint_max_examples
+#     does NOT reduce this -- run_secondary_eval() never passes a cap to the
+#     entity/typo slices, and checkpoint_eval_main: false means the main set
+#     doesn't run at checkpoints at all, so that knob is inert for this run;
+#     capping per-checkpoint eval size would need a code change first.
+#
+#     save_steps is what actually triggers the eval -- eval_steps does
+#     nothing here (no validation split with a Hub dataset and
+#     eval_split: null), kept equal for consistency.
+#
+#     early_stopping_patience (3, set in qwen3.5-2b-masked-weighted.yaml) is
+#     counted in CHECKPOINTS, so it's coupled to this: 3 x 500 = 1,500 steps
+#     without a new best before stopping. If save_steps changes again, revisit
+#     that number rather than leaving it at 3 by default.
 #   - test.checkpoint_max_examples: null -- was 150; now every checkpoint
 #     eval covers the full test set (falls back to test.max_examples, also
 #     null), not just the one-time baseline/final passes. Affordable now
@@ -60,13 +94,14 @@
 # Hub folder safety: PedramR/ASR_Post-processing (the shared Hub repo the
 # config's hub.repo_id points at) already has real run data under
 # qwen3.5-2b/, gemma-3-1b-it/, and qwen3.5-2b-50pct-masked-weighted/ (the
-# first pass at this same job, gradient_accumulation_steps=8 and
-# recoverable_correction_weight=3.0 -- verified directly via the Hub API
-# before writing this) -- NOT to be overwritten. This job is named
-# qwen3.5-2b-50pct-masked-weighted-v2 specifically so it doesn't collide with
-# that folder. hub.folder is left unset here on purpose: run_sweep.py
-# auto-namespaces it to each job's own `name` below when not overridden, so
-# this job lands in a new qwen3.5-2b-50pct-masked-weighted-v2/ folder in the
+# first pass at this same job, gradient_accumulation_steps=8,
+# recoverable_correction_weight=3.0, train_fraction=0.5 over 2 epochs --
+# verified directly via the Hub API before writing this) -- NOT to be
+# overwritten. This job is named qwen3.5-2b-100pct-masked-weighted-v2
+# specifically so it doesn't collide with that folder. hub.folder is left
+# unset here on purpose: run_sweep.py auto-namespaces it to each job's own
+# `name` below when not overridden, so this job lands in a new
+# qwen3.5-2b-100pct-masked-weighted-v2/ folder in the
 # same repo. Don't rename this job to "qwen3.5-2b", "gemma-3-1b-it", or
 # "qwen3.5-2b-50pct-masked-weighted" without also setting hub.folder
 # explicitly to something that isn't already in the repo.
@@ -85,14 +120,16 @@ output_root: ./outputs/qwen-mask-weighted
 followup: false
 
 jobs:
-  - name: qwen3.5-2b-50pct-masked-weighted-v2
+  # Renamed from qwen3.5-2b-50pct-... : train_fraction is 1.0 now, so "50pct"
+  # would be actively wrong in the Hub folder/output dir this name generates.
+  - name: qwen3.5-2b-100pct-masked-weighted-v2
     config: configs/train/qwen3.5-2b-masked-weighted.yaml
     overrides:
-      train_fraction: 0.5
+      train_fraction: 1.0
       use_unsloth: false
       training:
-        eval_steps: 1000
-        save_steps: 1000
+        eval_steps: 500
+        save_steps: 500
       test:
         checkpoint_max_examples: null
         checkpoint_eval_main: false
