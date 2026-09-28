@@ -20,6 +20,8 @@ at the repo root.
 | `grounding.py` | inference-time CRM name candidates, `crm_snap_edits` (model-free name snapping), eval-only reference entity labels (CRM + Gemini extractions) |
 | `rules.py` | model-free fixes for glued words and stutter-doubled letters |
 | `diff_filter_baseline.py` | step 1 (below) |
+| `build_diffs.py`, `llm_judge.py`, `make_label_sheet.py`, `calibrate.py`, `generate_targets.py` | step 2: differences, LLM judges, hand-labelling pages, judge calibration, training windows |
+| `corpus.py`, `normalize.py` | shared helpers: corpus word frequencies; punctuation stripping and style-only detection |
 
 Scripts are run from the repo root, e.g. `python3 src/edit/diff_filter_baseline.py`.
 Outputs go under `outputs/edit/` (gitignored).
@@ -80,7 +82,7 @@ What it showed:
    no product/brand catalog, so products/brands are evaluated (via Gemini
    labels) but not yet grounded.
 
-## Step 2: clean training targets (in progress)
+## Step 2: clean training targets
 
 Soniox's `text` is itself ASR output, so its differences from Whisper are
 checked one at a time before any of them become correction targets.
@@ -96,13 +98,14 @@ python3 src/edit/calibrate.py                     # judge vs hand labels -> cali
 - `build_diffs.py` applies `rules.py` first, aligns Whisper against Soniox,
   marks style-only differences (not judged), and sorts the rest into
   strata: `entity`, `phonetic_sub`, `other_sub`, `whisper_dropped`,
-  `whisper_extra`, `long`. On a 5,000-row sample: 88k differences, 73.5k
-  not style-only (about 15 per row), so judging the full 114k-row corpus
-  isn't practical. Rows get selected first.
+  `whisper_extra`, `long` (plus the never-judged `filler` and `garbled`,
+  see round 1 below). On a 5,000-row sample: 94.7k differences, 59.3k of
+  them judgeable (about 12 per row), so judging the full 114k-row corpus
+  isn't practical. Training windows get selected first (below).
 - `llm_judge.py` shows each difference **blind**: the two versions as A/B
   in a per-item random order, so neither a judge nor the person labelling
   knows which is Soniox. Verdicts map to `real_error` (Soniox right),
-  `soniox_wrong`, `style_variant`, `both_wrong`, `uncertain`. Each model
+  `soniox_wrong`, `either_fine`, `both_wrong`, `uncertain`. Each model
   runs as `@think` (reasoning on) and `@nothink`; results are cached per
   variant in `outputs/edit/judge/`.
 - Which judge to trust is decided by `calibrate.py` against the hand
@@ -132,7 +135,9 @@ as spelling-only and forced an A/B choice. Judges' real_error precision was
   with only the items where the judges agree with each other but not with
   the person, plus unlabelled split pieces.
 
-Prompt v2 on the 139 still-judged, hand-labelled items:
+Prompt v2 on the 139 still-judged, hand-labelled items (a later review
+round, 14 items, left these numbers essentially unchanged: 92% / 67% for
+the chosen rule on all 145):
 
 | rule for "real error" | precision | recall |
 |---|---|---|
@@ -147,13 +152,64 @@ Prompt v2 on the 139 still-judged, hand-labelled items:
 on about 11% of items (they stay Whisper's text). Cost: about $0.0016 per
 item for DeepSeek@think and $0.00014 for MiMo@think.
 
-Still to do in this step: the review round (`label_review.html`), then
-select a small, informative training set (entity/CRM rows, sound-alike
-substitutions, plenty of no-edit rows) and run the chosen judges on it.
+Cheaper judges were also tried on the same 145 items (Ling 3.0 Flash, GLM
+Flash, Mercury 2.5, Qwen3 235B, DeepSeek v4 Flash 0731). None matched
+DeepSeek v4.1 as the main judge; DeepSeek 0731 is a third cheaper per call
+but fails on 22% of items, dropping the rule's recall to 51–55%. Ling 3.0
+is as good as MiMo as the cheap first pass, but MiMo is only ~13% of the cost.
+
+### Training windows (`generate_targets.py`)
+
+The edit model trains on windows of a row, not whole rows: every
+difference in a training example has to be decided, and a whole row has
+about 12, many in hard or garbled stretches. Windows let us pick the ones
+that are cheap and clean to label.
+
+```bash
+python3 src/edit/generate_targets.py start --windows 2000   # background; resumable
+python3 src/edit/generate_targets.py status                 # progress, cost so far + projected
+python3 src/edit/generate_targets.py stop                   # graceful stop (in-flight calls saved)
+python3 src/edit/generate_targets.py assemble               # rebuild train.jsonl from cached answers only
+```
+
+- **select**: windows never cut through a difference; skipped if they
+  contain a garbled/long span. "Judged" windows have 1–3 substitution
+  differences per 50 words (entity windows first); "free" windows have
+  none, so they're no-edit examples at no cost. At most 2 windows per call.
+  Insertions/deletions (words Whisper dropped or added) are out of scope for
+  v1 and stay as Whisper has them.
+- **judge**: MiMo first on every difference; DeepSeek only where MiMo
+  didn't rule the edit out, in the same pool of parallel calls. Answers
+  are cached as they arrive; `stop` or Ctrl+C saves calls in flight (up to
+  60 s), and rerunning resumes without paying twice.
+- **assemble**: an edit is accepted by the calibrated rule (hand labels
+  override). A window with an *undecided* difference (DeepSeek ran out of
+  tokens, a judge unsure, both versions wrong) is left out: it might hide a
+  real error that the target would teach the model to leave in. Each window
+  also stores 15 words of read-only context on each side
+  (`left_context`/`right_context`); training uses plain windows by default,
+  with overlapping windows at inference instead.
+
+Two runs, on disjoint calls (`build_diffs.py --exclude-calls-from` built
+the second pool from calls not used before):
+
+| run | windows | with edits | edits | no-edit | excluded (undecided) | cost |
+|---|---|---|---|---|---|---|
+| `outputs/edit/data` (50 words) | 1,702 | 694 | 945 | 1,008 | 298 | $2.92 |
+| `outputs/edit/data_v2` (40–80 words) | 1,328 | 597 | 910 | 731 | 232 | $3.07 |
+| **total** | **3,030** | **1,291** | **1,855** | **1,739** | | **$5.99** |
+
+2,879 train / 151 validation windows, split by call. About 8% of windows
+are under 20 words (rows that are short themselves); the 109 under 10 words
+add little and are meant to be filtered at training time.
 
 ## Next steps
 
-3. **Train the edit model** on word-indexed input (`[1]word [2]word …`)
-   with a compact output (`3-4 → replacement`, or `NONE`), applied after
-   `rules.py`. Compare against `whisper`, `rules`, and the rewrite runs.
+3. **Train the edit model** (Qwen3.5-2B, LoRA) on word-indexed windows
+   (`[1]word [2]word …`) with a compact output (`12-13 → replacement` per
+   line, or `NONE`), applied after `rules.py`. Its own entry point,
+   `src/edit/train_edit.py --config …`, runnable by `src/run_sweep.py
+   --train_script` (sweep with `followup: false`). Evaluate on full test
+   transcripts via overlapping windows, scored with `scoring.py`; compare
+   against `whisper`, `rules`, and the rewrite runs.
 4. Add a separate span detector only if false edits remain a problem.

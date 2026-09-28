@@ -57,6 +57,12 @@ DEFAULT_MODELS = [
     "xiaomi/mimo-v2.6-flash@think", "xiaomi/mimo-v2.6-flash@nothink",
 ]
 THINK_MAX_TOKENS = 8000
+# Per-call HTTP timeout, and how long a stopped run waits for calls already
+# in flight. The OpenAI client's defaults (600s, plus its own retries) let a
+# single hung call block a graceful stop for many minutes.
+CALL_TIMEOUT_S = 120
+STOP_GRACE_S = 60
+STOP = threading.Event()  # set when a run is interrupted
 NOTHINK_MAX_TOKENS = 300
 # v2 (after hand-labelling round 1): adds "either" and makes A/B strict. In
 # round 1 the person used "same" for anything that doesn't matter -- filler
@@ -144,6 +150,13 @@ def parse_reply(text: str) -> dict | None:
     return d if d.get("verdict") in VERDICTS else None
 
 
+def make_client(api_key: str) -> OpenAI:
+    """OpenRouter client with a bounded per-call timeout and no client-side
+    retries (judge_one retries itself)."""
+    return OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key,
+                  timeout=CALL_TIMEOUT_S, max_retries=0)
+
+
 def split_spec(spec: str) -> tuple[str, bool]:
     """"model@think" / "model@nothink" -> (model, think)."""
     model, _, mode = spec.partition("@")
@@ -152,20 +165,24 @@ def split_spec(spec: str) -> tuple[str, bool]:
     return model, mode == "think"
 
 
-def judge_one(client: OpenAI, spec: str, item: dict, retries: int = 4) -> dict:
+def judge_one(client: OpenAI, spec: str, item: dict, retries: int = 4, max_tokens: int | None = None) -> dict:
     model, think = split_spec(spec)
+    max_tokens = max_tokens or (THINK_MAX_TOKENS if think else NOTHINK_MAX_TOKENS)
     extra = {"usage": {"include": True}}
     if not think:
         extra["reasoning"] = {"enabled": False}
     last_error = None
     for attempt in range(retries):
+        if STOP.is_set():
+            return {"id": item["id"], "prompt_version": PROMPT_VERSION, "model": spec,
+                    "error": "stopped before answering"}  # not final: judged again on resume
         try:
             resp = client.chat.completions.create(
                 model=model,
                 messages=[{"role": "system", "content": SYSTEM_PROMPT},
                           {"role": "user", "content": user_prompt(item)}],
                 temperature=0,
-                max_tokens=THINK_MAX_TOKENS if think else NOTHINK_MAX_TOKENS,
+                max_tokens=max_tokens,
                 extra_body=extra,
             )
             text = resp.choices[0].message.content or ""
@@ -178,9 +195,11 @@ def judge_one(client: OpenAI, spec: str, item: dict, retries: int = 4) -> dict:
                         "cost": usage.get("cost"), "raw": text}
             last_error = f"unparseable reply: {text[:200]!r}"
             if resp.choices[0].finish_reason == "length":
-                # Deterministic at temperature 0 -- a retry would hit the same limit.
+                # Deterministic at temperature 0 -- a retry (or a resumed run)
+                # would hit the same limit, so this is recorded as final.
                 return {"id": item["id"], "prompt_version": PROMPT_VERSION, "model": spec,
-                        "error": "hit max_tokens before answering"}
+                        "error": "hit max_tokens before answering", "max_tokens": max_tokens,
+                        "cost": usage.get("cost")}
         except Exception as e:  # network/rate-limit/provider errors: retry with backoff
             last_error = f"{type(e).__name__}: {e}"
         time.sleep(2 ** attempt)
@@ -198,28 +217,126 @@ def load_cache(path: Path, prompt_version: str = PROMPT_VERSION) -> dict[str, di
     return done
 
 
+def load_final_failures(path: Path, max_tokens: int) -> dict[str, dict]:
+    """Items that already ran out of tokens at >= max_tokens: rerunning them
+    would only fail again, so a resumed run skips them."""
+    if not path.exists():
+        return {}
+    failed = {}
+    for line in path.open(encoding="utf-8"):
+        r = json.loads(line)
+        if (r.get("prompt_version") == PROMPT_VERSION and r.get("error") == "hit max_tokens before answering"
+                and (r.get("max_tokens") or 0) >= max_tokens):
+            failed[r["id"]] = r
+    return failed
+
+
 def cache_path(out_dir: Path, spec: str) -> Path:
     return out_dir / f"{spec.replace('/', '__')}.jsonl"
 
 
-def run_model(client: OpenAI, model: str, items: list[dict], out_dir: Path, workers: int) -> dict:
-    path = cache_path(out_dir, model)
-    done = load_cache(path)
-    todo = [it for it in items if it["id"] not in done]
-    print(f"{model}: {len(done)} cached, {len(todo)} to judge")
-    lock = threading.Lock()
-    with path.open("a", encoding="utf-8") as f, ThreadPoolExecutor(workers) as pool:
-        futures = [pool.submit(judge_one, client, model, it) for it in todo]
-        for fut in tqdm(as_completed(futures), total=len(futures), desc=model):
-            r = fut.result()
-            with lock:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-                f.flush()
+class JudgeCache:
+    """One model's answers: the <model>.jsonl cache file, loaded once and
+    appended to (thread-safely, flushed per line) as answers arrive, so an
+    interrupted run loses nothing it paid for."""
+
+    def __init__(self, out_dir: Path, spec: str, max_tokens: int | None = None):
+        self.spec = spec
+        self.path = cache_path(out_dir, spec)
+        self.max_tokens = max_tokens or (THINK_MAX_TOKENS if split_spec(spec)[1] else NOTHINK_MAX_TOKENS)
+        self.done = load_cache(self.path)
+        self.failed = load_final_failures(self.path, self.max_tokens)
+        self._lock = threading.Lock()
+        self._file = self.path.open("a", encoding="utf-8")
+
+    def has(self, item_id: str) -> bool:
+        """Answered, or already failed for good (would only fail again)."""
+        return item_id in self.done or item_id in self.failed
+
+    def label(self, item: dict) -> str:
+        r = self.done.get(item["id"])
+        return to_label(item, r["verdict"]) if r else "missing"
+
+    def judge(self, client: OpenAI, item: dict) -> dict:
+        """Cached answer, or a new call whose result is saved immediately."""
+        if item["id"] in self.done:
+            return self.done[item["id"]]
+        r = judge_one(client, self.spec, item, 4, self.max_tokens)
+        with self._lock:
+            self._file.write(json.dumps(r, ensure_ascii=False) + "\n")
+            self._file.flush()
             if "verdict" in r:
-                done[r["id"]] = r
-    errors = len(items) - sum(it["id"] in done for it in items)
-    cost = sum(done[it["id"]].get("cost") or 0 for it in items if it["id"] in done)
-    return {"judged": len(items) - errors, "errors": errors, "cost_usd": round(cost, 4)}
+                self.done[item["id"]] = r
+            elif r.get("max_tokens"):
+                self.failed[item["id"]] = r
+        return r
+
+    def stats(self, items: list[dict]) -> dict:
+        ids = {it["id"] for it in items}
+        judged = ids & set(self.done)
+        failed = ids & set(self.failed)
+        cost = sum(self.done[i].get("cost") or 0 for i in judged) + sum(self.failed[i].get("cost") or 0 for i in failed)
+        return {"judged": len(judged), "failed": len(failed), "errors": len(ids - judged - failed),
+                "cost_usd": round(cost, 4)}
+
+    def close(self):
+        self._file.close()
+
+
+def run_tasks(tasks: list, workers: int, on_done=None, desc: str = "judging"):
+    """Runs zero-argument callables on a thread pool, calling on_done(result)
+    as each finishes.
+
+    Ctrl+C / SIGTERM (as KeyboardInterrupt in the main thread): pending tasks
+    are cancelled, judge_one stops retrying (STOP), the tasks already in
+    flight are waited for up to STOP_GRACE_S so their answers get saved, then
+    KeyboardInterrupt is re-raised. A second interrupt stops immediately."""
+    pool = ThreadPoolExecutor(workers)
+    pending = {pool.submit(t) for t in tasks}
+    bar = tqdm(total=len(pending), desc=desc)
+    try:
+        for fut in as_completed(pending):
+            r = fut.result()
+            bar.update(1)
+            if on_done:
+                on_done(r)
+    except KeyboardInterrupt:
+        STOP.set()
+        for fut in pending:
+            fut.cancel()
+        in_flight = [fut for fut in pending if not fut.done() and not fut.cancelled()]
+        print(f"\nInterrupted: saving {len(in_flight)} calls already in flight, for up to "
+              f"{STOP_GRACE_S}s (interrupt again to stop immediately)...", flush=True)
+        try:
+            for fut in as_completed(in_flight, timeout=STOP_GRACE_S):
+                bar.update(1)
+                if on_done:
+                    on_done(fut.result())
+        except TimeoutError:
+            print("Some calls didn't finish in time; they'll be judged again on resume.", flush=True)
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise KeyboardInterrupt
+    finally:
+        bar.close()
+    pool.shutdown(wait=False)
+
+
+def run_models(client: OpenAI, specs: list[str], items: list[dict], out_dir: Path, workers: int,
+               max_tokens: int | None = None) -> dict[str, dict]:
+    """Judges `items` with every model in `specs` side by side -- one shared
+    pool, so the total time is about the slowest model's, not the sum."""
+    caches = {s: JudgeCache(out_dir, s, max_tokens) for s in specs}
+    tasks = []
+    for s, cache in caches.items():
+        todo = [it for it in items if not cache.has(it["id"])]
+        print(f"{s}: {len(items) - len(todo)} cached or failed before, {len(todo)} to judge")
+        tasks += [lambda c=cache, it=it: c.judge(client, it) for it in todo]
+    try:
+        run_tasks(tasks, workers)
+    finally:
+        for c in caches.values():
+            c.close()
+    return {s: c.stats(items) for s, c in caches.items()}
 
 
 def main():
@@ -227,14 +344,14 @@ def main():
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
         sys.exit("OPENROUTER_API_KEY must be set in .env")
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key)
+    client = make_client(key)
     items = [json.loads(line) for line in open(args.items, encoding="utf-8")]
     if args.limit:
         items = items[:args.limit]
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for model in args.models.split(","):
-        print(model, run_model(client, model, items, out_dir, args.workers))
+    for model, stats in run_models(client, args.models.split(","), items, out_dir, args.workers).items():
+        print(model, stats)
 
 
 if __name__ == "__main__":

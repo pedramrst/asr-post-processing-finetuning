@@ -36,6 +36,8 @@ judge caches line up.
 Example:
   python3 src/edit/build_diffs.py
   python3 src/edit/build_diffs.py --max-rows 5000   # quick look
+  python3 src/edit/build_diffs.py --max-rows 8000 --output-dir outputs/edit/targets_v2 \
+      --exclude-calls-from outputs/edit/targets/rows.jsonl   # a fresh pool of new calls
 """
 from __future__ import annotations
 
@@ -88,6 +90,9 @@ def parse_args():
     p.add_argument("--train-repo", default="PedramR/ASR_Post-processing-dataset")
     p.add_argument("--output-dir", default="outputs/edit/targets")
     p.add_argument("--max-rows", type=int, default=None, help="Random sample of unique rows (default: all).")
+    p.add_argument("--exclude-calls-from", default=None,
+                   help="Comma-separated rows.jsonl files from earlier builds: their calls are left out, so a new "
+                        "pool (e.g. for more training data) never overlaps windows already made from them.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--workers", type=int, default=8)
     return p.parse_args()
@@ -244,6 +249,12 @@ def main():
     freq = load_corpus_freq(args.train_repo)
     rows = load_unique_rows(args.train_repo)
     print(f"{len(rows)} unique rows")
+    if args.exclude_calls_from:
+        excluded = set()
+        for path in args.exclude_calls_from.split(","):
+            excluded |= {json.loads(line)["call_id"] for line in open(path, encoding="utf-8")}
+        rows = [r for r in rows if r["call_id"] not in excluded]
+        print(f"{len(rows)} rows left after excluding {len(excluded)} calls from {args.exclude_calls_from}")
     if args.max_rows and args.max_rows < len(rows):
         rows = random.Random(args.seed).sample(rows, args.max_rows)
 
