@@ -15,9 +15,12 @@ data:
 
 training:
   num_train_epochs: 3.0    # ~2,780 windows / effective batch 16 = ~175 steps per epoch
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 2
+  # 4 x 4, not 8 x 2: Qwen3.5's ~248k-token vocabulary makes the logits of an
+  # 8 x ~600-token batch several GB -- the smoke test's first eval_loss pass
+  # hit an OOM at batch 8 on a 32 GB card (recovered, but no margin left).
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 4
+  gradient_accumulation_steps: 4
   learning_rate: 1.0e-4
   warmup_ratio: 0.05
   eval_steps: 50           # eval_loss on the 144 validation windows; best checkpoint kept
