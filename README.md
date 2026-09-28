@@ -51,6 +51,10 @@ dropped SSH connection doesn't kill a multi-hour run:
                                # config has source: build (not the prebuilt default)
 ./run.sh train gemma-3-1b-it   # same, for the other config
 ./run.sh sweep                 # the model comparison (configs/train/sweep.yaml) -- same `build` rule
+./run.sh sweep <sweep-config>  # a different sweep: a bare name against configs/train/, or any
+                               # .yaml path (so a sweep outside configs/train/ is reachable too).
+                               # Extra args go to run_sweep.py -- notably `--train_script`, which
+                               # points a sweep at a training entry point other than src/train.py
 ./run.sh full                  # build + sweep back to back -- multi-hour, real GPU cost
 ```
 

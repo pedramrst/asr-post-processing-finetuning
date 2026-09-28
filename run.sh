@@ -29,8 +29,18 @@
 #                     prebuilt (the default), no build step needed. Unlike
 #                     `sweep`, output_dir/hub.folder come straight from that
 #                     config file, not auto-namespaced.
-#   ./run.sh sweep    Run the model comparison (configs/train/sweep.yaml).
-#                     Same `build` requirement as `train`.
+#   ./run.sh sweep [<sweep-config>] [--train_script path ...]
+#                     Run a sweep -- configs/train/sweep.yaml by default, so
+#                     a bare `./run.sh sweep` behaves exactly as before.
+#                     Resolves like `train` does: a bare name against
+#                     configs/train/ (`./run.sh sweep sweep_foo`) or any
+#                     path to a .yaml (`./run.sh sweep configs/edit/sweep.yaml`),
+#                     which is how a sweep living outside configs/train/ is
+#                     reached. Anything after the name is forwarded to
+#                     run_sweep.py -- notably `--train_script`, which points
+#                     a sweep at a training entry point other than
+#                     src/train.py (see run_sweep() below). Same `build`
+#                     requirement as `train`.
 #   ./run.sh full     build + sweep, back to back. Multi-hour, real GPU cost --
 #                     run `smoke` first if you haven't already.
 #   ./run.sh agent    Start the Telegram + LLM tool-calling operations agent
@@ -71,7 +81,7 @@ case "$MODE" in
     fi
     ;;
   *)
-    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full|agent]" >&2
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep [<sweep-config>]|full|agent]" >&2
     exit 1
     ;;
 esac
@@ -211,9 +221,35 @@ require_built_data() {
 }
 
 run_sweep() {
+  local sweep="${1:-sweep}" sweep_path
+  shift || true
+  # Same resolution as run_train's: a bare name against configs/train/ (with
+  # or without .yaml), or any path to a .yaml file. The path form is what
+  # reaches a sweep outside configs/train/ -- e.g. a second correction
+  # method keeping its configs in its own directory. Anything after the
+  # sweep name is forwarded to run_sweep.py, which is how a sweep driving a
+  # different training entry point selects it:
+  #   ./run.sh sweep configs/edit/sweep.yaml --train_script src/edit/train_edit.py
+  # run_sweep.py itself is already train-script-agnostic: it only ever runs
+  # `python <train_script> --config <materialized job config>`, and merges
+  # each job's config as raw YAML without validating it against train.py's
+  # own Config schema, so a different script's config keys pass through
+  # untouched. Its summary readers (trainer_state.json, test_eval/
+  # metrics.json) just report n/a when a script doesn't write those.
+  if [ -f "$sweep" ]; then
+    sweep_path="$sweep"
+  elif [ -f "configs/train/$sweep.yaml" ]; then
+    sweep_path="configs/train/$sweep.yaml"
+  elif [ -f "configs/train/$sweep" ]; then
+    sweep_path="configs/train/$sweep"
+  else
+    echo "Sweep config not found: '$sweep'. Available sweep configs (any YAML under configs/ with a top-level 'jobs:'):" >&2
+    grep -l '^jobs:' configs/*/*.yaml 2>/dev/null | sed 's/^/  /' >&2 || true
+    exit 1
+  fi
   require_built_data
-  log "Running model comparison sweep (configs/train/sweep.yaml)"
-  python src/run_sweep.py --sweep configs/train/sweep.yaml
+  log "Running sweep ($sweep_path)"
+  python src/run_sweep.py --sweep "$sweep_path" "$@"
 }
 
 run_agent() {
@@ -261,11 +297,11 @@ case "$MODE" in
   smoke) run_smoke ;;
   build) run_build ;;
   train) run_train "$CONFIG_ARG" "${@:3}" ;;
-  sweep) run_sweep ;;
+  sweep) run_sweep "$CONFIG_ARG" "${@:3}" ;;
   full)  run_build; run_sweep ;;
   agent) run_agent ;;
   *)
-    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep|full|agent]" >&2
+    echo "Unknown mode '$MODE'. Usage: ./run.sh [smoke|build|train <config>|sweep [<sweep-config>]|full|agent]" >&2
     exit 1
     ;;
 esac
