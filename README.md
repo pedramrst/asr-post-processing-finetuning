@@ -529,10 +529,10 @@ triggers a generation pass over that dataset: the model corrects each
 `test.input_column` value, and scored against `test.target_column`:
 
 - `test_eval/predictions.jsonl` -- one row per example: `input`, `output`,
-  `reference`, `wer`, `input_overlap_pct`, `hallucinated`, `fix_rate`,
-  `preservation_rate`. Overwritten each time with the latest checkpoint's
-  results (not one file per checkpoint).
-- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "hallucination_rate": ..., "fix_rate": ..., "preservation_rate": ..., "targeted_score": ..., "fix_rate_lenient": ..., "preservation_rate_lenient": ..., "targeted_score_lenient": ..., "n_examples": ...}`.
+  `reference`, `wer`, `input_overlap_pct`, `hallucinated`, `premature_stop`,
+  `fix_rate`, `preservation_rate`. Overwritten each time with the latest
+  checkpoint's results (not one file per checkpoint).
+- `test_eval/metrics.json` -- `{"wer": ..., "exact_match": ..., "hallucination_rate": ..., "premature_stop_rate": ..., "fix_rate": ..., "preservation_rate": ..., "targeted_score": ..., "fix_rate_lenient": ..., "preservation_rate_lenient": ..., "targeted_score_lenient": ..., "n_examples": ...}`.
   `wer` (via `jiwer`, corpus-level) gives partial credit for near-misses;
   `exact_match` (fraction of rows the model got byte-for-byte right) is a
   stricter complementary read, and a direct signal on over/under-correction
@@ -547,6 +547,17 @@ triggers a generation pass over that dataset: the model corrects each
   (default `50.0`). This is the model's actual generation behavior, a
   complement to `prepare_split.py`'s `--overlap-floor` (below), which instead
   filters *training* pairs before the model ever sees them.
+- `premature_stop_rate` / `premature_stop` is the opposite failure mode from
+  hallucination: under-generation instead of over-generation -- the model
+  stops before actually correcting the rest of the call. A row is flagged
+  when its output's word count is under `test.premature_stop_ratio` (default
+  `0.3`) of the *input*'s, and only checked once the input itself has at
+  least `test.premature_stop_min_input_words` words (default `30`), so a
+  genuinely short call isn't flagged for correctly having a short output.
+  Added after finding this happening on 10.5% of `qwen3.5-2b-50pct-masked-weighted`'s
+  final-checkpoint predictions (vs. 0.6% at the pre-training baseline on the
+  same rows) -- see "Short-target end-of-sequence down-weighting" below for
+  the training-side cause and fix this tracks regressions/improvements on.
 - `fix_rate` / `preservation_rate` / `targeted_score` answer a more specific
   question than any metric above: not "how close is the output to the
   reference overall," but "did it fix the actual errors, and leave
@@ -607,14 +618,14 @@ triggers a generation pass over that dataset: the model corrects each
   substitute: tested directly, it wrongly flags phrases whose words occur
   200,000+ times in training (`دیگه کیفیه`, `مشکل خوردین`) simply because
   they're rare within 1,368 eval rows.
-- all ten (`wer`, `exact_match`, `hallucination_rate`, `fix_rate`,
-  `preservation_rate`, `targeted_score`, the three `_lenient` variants, and
-  `fix_rate_recoverable`) are also logged to TensorBoard as `test_wer`/
-  `test_exact_match`/`test_hallucination_rate`/`test_fix_rate`/
-  `test_preservation_rate`/`test_targeted_score`/`test_fix_rate_lenient`/
-  `test_preservation_rate_lenient`/`test_targeted_score_lenient`/
-  `test_fix_rate_recoverable`, so you get curves over training steps, not
-  just final numbers.
+- all eleven (`wer`, `exact_match`, `hallucination_rate`,
+  `premature_stop_rate`, `fix_rate`, `preservation_rate`, `targeted_score`,
+  the three `_lenient` variants, and `fix_rate_recoverable`) are also logged
+  to TensorBoard as `test_wer`/`test_exact_match`/`test_hallucination_rate`/
+  `test_premature_stop_rate`/`test_fix_rate`/`test_preservation_rate`/
+  `test_targeted_score`/`test_fix_rate_lenient`/`test_preservation_rate_lenient`/
+  `test_targeted_score_lenient`/`test_fix_rate_recoverable`, so you get
+  curves over training steps, not just final numbers.
 
 `test.repetition_penalty` and `test.no_repeat_ngram_size` are **off by
 default** (`1.0`/`0`). For a decoder-only model, `generate()` applies both
@@ -1028,6 +1039,63 @@ Compare all three (or four) runs' `test_fix_rate_recoverable` /
 specifically -- pushing harder on corrections risks over-correction (the
 model "fixing" text that was already right), which `preservation_rate`
 would catch and `fix_rate`/`test_wer` alone would not.
+
+### Short-target end-of-sequence down-weighting
+
+Found by inspecting `qwen3.5-2b-50pct-masked-weighted`'s final-checkpoint
+predictions after a manager asked why output length varied so much from
+input length: the model stopped generating early on **10.5%** of the main
+test set (1,978 rows), and **82.7%** of those stopped right after the word
+"بله" (yes) -- typically only a sentence or two into a call that runs on for
+hundreds more words. The pre-training baseline does this on only **0.6%**
+of the same rows, so this is something fine-tuning taught, not a
+pre-existing model quirk.
+
+Traced to the training data, not a decoding bug: `data/asr_dataset_curated.jsonl`
+has zero rows where a target is under 30% of its Whisper input's length --
+training never shows the model a short target paired with a much longer
+input -- but it does have 1,275 rows (0.7% of the corpus) whose target is
+short (<= 20 words) *and* genuinely ends right after "بله" -- a real,
+correctly-labeled call that's just a brief exchange. The problem is
+structural: that row's "greeting-and-agreement flow -> end of sequence"
+shape is nearly identical to the *opening* of almost every other call, long
+or short, since Persian call-center openings are formulaic. With only
+~0.7% of rows carrying the "stop here" signal at a position that recurs in
+nearly every example, the model over-generalized it to calls that don't
+actually end there.
+
+`short_target_eos_weight` (default `1.0`, a no-op) multiplies the per-token
+loss for the trailing end-of-turn token(s) a short target's chat-template
+rendering appends (e.g. Qwen's `<|im_end|>\n`) -- not the target's own
+content tokens, which train normally regardless (the word "بله" itself is
+correct wherever it appears; only the "and therefore stop" signal that
+follows it, on short rows specifically, is what gets toned down). A target
+counts as short when it's at most `short_target_max_words` words (default
+`20`, picked by inspecting the "بله"-ending subset, then applied to every
+row regardless of ending word -- deliberately not keyed on that one word
+specifically, since any short call's closing phrase risks the same
+structural collision with other calls' openings). Under that general rule
+the actual affected population is larger than the 0.7% initially diagnosed:
+**5.14%** of the curated training set (9,444/183,880 rows), verified
+directly. Down-weighting instead of masking (`labels = -100`) on purpose --
+some signal that short calls really do end is still wanted, just not at the
+strength implied by uniform per-token weighting.
+
+Shares `train.py`'s `WeightedLossTrainer` with `recoverable_correction_weight`
+-- either one being non-`1.0` is enough to switch off the plain `Trainer`
+(see `uses_token_weights` in `main()`), and both weights can be set
+independently at the same time; they never touch the same token positions
+(recoverable-correction spans are computed from the target's own content
+characters, short-target down-weighting only from the tail *after* them),
+so they can't disagree about the same token.
+
+`configs/train/qwen3.5-2b-masked-weighted.yaml` sets `short_target_eos_weight: 0.3`
+for the `v2` sweep run -- a starting point, not tuned. Watch
+`test_premature_stop_rate` (below, alongside the existing
+fix_rate/preservation_rate curves) to see whether it actually reduces this
+specific failure, not just WER in aggregate -- a WER improvement alone
+wouldn't distinguish "fixed the early-stopping problem" from "got better at
+something else entirely."
 
 ### Best checkpoint by WER
 

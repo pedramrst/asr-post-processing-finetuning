@@ -272,6 +272,8 @@ def run_test_eval(
     batch_size: int = 8,
     max_examples: int | None = None,
     hallucination_overlap_floor: float = 50.0,
+    premature_stop_ratio: float = 0.3,
+    premature_stop_min_input_words: int = 30,
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
     row_type_filter: str | None = None,
@@ -364,6 +366,23 @@ def run_test_eval(
     input_overlaps = [_word_overlap_pct(pred, ex[input_column]) for ex, pred in zip(ds, predictions)]
     hallucinated_flags = [ov < hallucination_overlap_floor for ov in input_overlaps]
 
+    # The opposite failure mode from hallucination: the model stops
+    # generating early instead of over-generating. Flags a row when the
+    # *output* is under premature_stop_ratio of the *input*'s word count --
+    # only checked once the input itself has at least
+    # premature_stop_min_input_words words, so a genuinely short call (a
+    # short output is the correct shape there) is never flagged. See
+    # Config.test_premature_stop_ratio's docstring for why these defaults
+    # are safe for this task specifically: zero rows in this project's own
+    # curated training set have a target under 30% of its Whisper input's
+    # length, so a prediction that short on a long input reliably indicates
+    # a generation failure here, not a plausible real correction shape.
+    input_word_counts = [len(ex[input_column].split()) for ex in ds]
+    premature_stop_flags = [
+        in_words >= premature_stop_min_input_words and len(pred.split()) < premature_stop_ratio * in_words
+        for in_words, pred in zip(input_word_counts, predictions)
+    ]
+
     # Targeted correction accuracy: WER/exact_match score the whole
     # sentence at once, which can't tell "fixed the actual errors" apart
     # from "left everything alone and got lucky" or "rewrote words that
@@ -414,8 +433,8 @@ def run_test_eval(
     out_path = Path(output_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
-        for ex, pred, ref, input_overlap, hallucinated in zip(
-            ds, predictions, references, input_overlaps, hallucinated_flags
+        for ex, pred, ref, input_overlap, hallucinated, premature_stop in zip(
+            ds, predictions, references, input_overlaps, hallucinated_flags, premature_stop_flags
         ):
             pred_alignment = jiwer.process_words([ref], [pred]) if ref else None
             row_wer = pred_alignment.wer if pred_alignment else None
@@ -490,6 +509,7 @@ def run_test_eval(
                         "wer_zwnj_normalized": row_wer_zwnj_normalized,
                         "input_overlap_pct": input_overlap,
                         "hallucinated": hallucinated,
+                        "premature_stop": premature_stop,
                         "fix_rate": row_fix_rate,
                         "preservation_rate": row_preservation_rate,
                         "fix_rate_lenient": row_fix_rate_lenient,
@@ -502,6 +522,7 @@ def run_test_eval(
             )
 
     hallucination_rate = sum(hallucinated_flags) / len(hallucinated_flags) if hallucinated_flags else None
+    premature_stop_rate = sum(premature_stop_flags) / len(premature_stop_flags) if premature_stop_flags else None
     fix_rate = fix_hits / fix_total if fix_total else None
     preservation_rate = preserve_hits / preserve_total if preserve_total else None
     targeted_score = (
@@ -534,6 +555,7 @@ def run_test_eval(
         "fix_rate_recoverable": fix_rate_recoverable,
         "unrecoverable_targets": unrecoverable_targets if low_signal_corpus_freq is not None else None,
         "hallucination_rate": hallucination_rate,
+        "premature_stop_rate": premature_stop_rate,
         "n_examples": len(ds),
     }
     # Atomic write (temp file + os.replace), not a direct write_text(): a
@@ -599,6 +621,7 @@ def test_log_values(metrics: dict, prefix: str = "test") -> dict:
         f"{prefix}_wer_zwnj_normalized": metrics["wer_zwnj_normalized"],
         f"{prefix}_exact_match": metrics["exact_match"],
         f"{prefix}_hallucination_rate": metrics["hallucination_rate"],
+        f"{prefix}_premature_stop_rate": metrics["premature_stop_rate"],
         f"{prefix}_fix_rate": metrics["fix_rate"],
         f"{prefix}_preservation_rate": metrics["preservation_rate"],
         f"{prefix}_targeted_score": metrics["targeted_score"],
@@ -633,7 +656,7 @@ def run_secondary_eval(model, tokenizer, cfg, dataset_id: str | None, name: str,
     Writes to <output_dir>/<output_subdir>/, reusing every other test.*
     generation setting from cfg. If `trainer` is given, logs
     test_<name>_wer/wer_zwnj_normalized/exact_match/hallucination_rate/
-    fix_rate/preservation_rate/targeted_score.
+    premature_stop_rate/fix_rate/preservation_rate/targeted_score.
 
     `name` also selects cfg.test_<name>_row_type (e.g. test_entity_row_type)
     -- set that when dataset_id points at a combined eval repo holding
@@ -656,6 +679,8 @@ def run_secondary_eval(model, tokenizer, cfg, dataset_id: str | None, name: str,
         batch_size=cfg.test_batch_size,
         row_type_filter=getattr(cfg, f"test_{name}_row_type", None),
         hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+        premature_stop_ratio=cfg.test_premature_stop_ratio,
+        premature_stop_min_input_words=cfg.test_premature_stop_min_input_words,
         repetition_penalty=cfg.test_repetition_penalty,
         no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
         fix_weight=cfg.test_fix_weight,
@@ -688,6 +713,9 @@ class TestEvalCallback(TrainerCallback):
         self.tokenizer = tokenizer
         self.trainer = None
         self.low_signal_corpus_freq = low_signal_corpus_freq
+        # Consecutive checkpoint saves (with a comparable WER available)
+        # since the last new best -- see Config.early_stopping_patience.
+        self.checkpoints_since_best = 0
 
     def on_save(self, args, state, control, **kwargs):
         # This fires on every checkpoint save (potentially hundreds of times
@@ -729,6 +757,8 @@ class TestEvalCallback(TrainerCallback):
                 batch_size=self.cfg.test_batch_size,
                 max_examples=max_examples,
                 hallucination_overlap_floor=self.cfg.test_hallucination_overlap_floor,
+                premature_stop_ratio=self.cfg.test_premature_stop_ratio,
+                premature_stop_min_input_words=self.cfg.test_premature_stop_min_input_words,
                 repetition_penalty=self.cfg.test_repetition_penalty,
                 no_repeat_ngram_size=self.cfg.test_no_repeat_ngram_size,
                 fix_weight=self.cfg.test_fix_weight,
@@ -749,12 +779,30 @@ class TestEvalCallback(TrainerCallback):
             best_source = {"wer": sum(wers) / len(wers) if wers else None}
 
         checkpoint_dir = Path(args.output_dir) / f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}"
-        _, best_wer = update_best_checkpoint(self.cfg.output_dir, str(checkpoint_dir), best_source, state.global_step)
+        updated, best_wer = update_best_checkpoint(self.cfg.output_dir, str(checkpoint_dir), best_source, state.global_step)
         if best_wer is not None:
             log_values["test_best_wer"] = best_wer
 
         if self.trainer is not None and log_values:
             self.trainer.log(log_values)
+
+        # Early stopping: only counts saves where a WER was actually
+        # available to compare (best_wer is None when neither the main set
+        # nor the entity/typo fallback produced one this checkpoint, e.g.
+        # test_checkpoint_eval_main off with no entity/typo dataset either)
+        # -- an eval-less save shouldn't count against patience either way.
+        if self.cfg.early_stopping_patience is not None and best_wer is not None:
+            if updated:
+                self.checkpoints_since_best = 0
+            else:
+                self.checkpoints_since_best += 1
+                if self.checkpoints_since_best >= self.cfg.early_stopping_patience:
+                    print(
+                        f"Early stopping: best_wer={best_wer:.4f} hasn't improved for "
+                        f"{self.checkpoints_since_best} checkpoint(s) (patience="
+                        f"{self.cfg.early_stopping_patience}). Stopping at step {state.global_step}."
+                    )
+                    control.should_training_stop = True
 
 
 def _cli() -> None:
@@ -771,6 +819,12 @@ def _cli() -> None:
     p.add_argument("--max_examples", type=int, default=None)
     p.add_argument("--hallucination_overlap_floor", type=float, default=50.0,
                     help="Flag a prediction as hallucinated when under this %% of its words appear in the input.")
+    p.add_argument("--premature_stop_ratio", type=float, default=0.3,
+                    help="Flag a prediction as premature_stop when its word count is under this fraction of the "
+                         "input's, on inputs at least --premature_stop_min_input_words long.")
+    p.add_argument("--premature_stop_min_input_words", type=int, default=30,
+                    help="Only check --premature_stop_ratio on inputs with at least this many words -- a "
+                         "genuinely short input can correctly have a short output.")
     p.add_argument("--repetition_penalty", type=float, default=1.0,
                     help="Penalizes repeated tokens during greedy decoding. 1.0 (default) disables it. Applies "
                          "to the prompt too, i.e. the input transcript -- anything above 1.0 discourages copying "
@@ -799,6 +853,8 @@ def _cli() -> None:
         batch_size=args.batch_size,
         max_examples=args.max_examples,
         hallucination_overlap_floor=args.hallucination_overlap_floor,
+        premature_stop_ratio=args.premature_stop_ratio,
+        premature_stop_min_input_words=args.premature_stop_min_input_words,
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
     )

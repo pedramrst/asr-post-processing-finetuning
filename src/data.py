@@ -534,6 +534,43 @@ def _weight_recoverable_correction_spans(
     return weighted
 
 
+def _downweight_short_target_eos(
+    tokenizer: PreTrainedTokenizerBase,
+    target_text: str,
+    input_ids: list[int],
+    token_weights: list[float],
+    prompt_len: int,
+    weight: float,
+) -> int:
+    """Sets token_weights[i] = `weight` for the target's trailing
+    end-of-turn token(s) -- whatever the chat template appends after the
+    target's own content (e.g. Qwen's "<|im_end|>\\n") -- see
+    Config.short_target_eos_weight and README's "Short-target
+    end-of-sequence down-weighting".
+
+    Only touches that closing tail, located the same way
+    _mask_low_signal_spans()/_weight_recoverable_correction_spans() locate
+    their spans (via _locate_target_tokens()): the target's own content
+    tokens -- including whatever word it actually ends on -- are untouched
+    and keep training at normal weight; this only affects the token(s) that
+    teach the model "stop generating now".
+
+    Returns the number of tokens down-weighted this way -- 0 if the
+    target's tokens can't be located (e.g. a row truncated mid-target, same
+    fallback as the other two span functions) or if there's no tail left
+    after the target within max_length (e.g. truncated exactly at the
+    target's last token).
+    """
+    located = _locate_target_tokens(tokenizer, target_text, input_ids, prompt_len)
+    if located is None:
+        return 0
+    target_offsets, start = located
+    tail_start = start + len(target_offsets)
+    for i in range(tail_start, len(input_ids)):
+        token_weights[i] = weight
+    return len(input_ids) - tail_start
+
+
 def build_example(
     tokenizer: PreTrainedTokenizerBase,
     whisper_text: str,
@@ -546,6 +583,8 @@ def build_example(
     mask_corpus_freq: Counter | None = None,
     mask_max_common_freq: int = 1,
     recoverable_correction_weight: float = 1.0,
+    short_target_eos_weight: float = 1.0,
+    short_target_max_words: int = 20,
 ) -> dict:
     """Tokenize one (whisper_text -> target_text) pair with loss masked to the target span.
 
@@ -562,7 +601,9 @@ def build_example(
     gets placeholder tensor fields) -- a `masked_low_signal_tokens` count
     (always 0 unless `mask_low_signal_corrections` is set), and a
     `weighted_recoverable_tokens` count (always 0 unless
-    `recoverable_correction_weight != 1.0`).
+    `recoverable_correction_weight != 1.0`), and a
+    `short_target_downweighted_tokens` count (always 0 unless
+    `short_target_eos_weight != 1.0`).
 
     `on_long_example` controls what happens when the full prompt+target
     exceeds `max_length`:
@@ -599,6 +640,20 @@ def build_example(
     guessable," just keeping opposite halves of the same answer (see
     word_correction_categories()), so they share one set of thresholds
     rather than risking two configs disagreeing about the same word.
+
+    `short_target_eos_weight`, if not 1.0, multiplies the per-token loss
+    (same WeightedLossTrainer mechanism as recoverable_correction_weight)
+    for the trailing end-of-turn token(s) the chat template appends after a
+    *short* target (<= `short_target_max_words` words) -- see
+    Config.short_target_eos_weight for why: a short call whose target
+    legitimately ends right after a common phrase (e.g. "بله") teaches
+    "stop here" at a position that's structurally identical to the opening
+    of almost every other call, long or short, and with few such rows
+    relative to the whole corpus, the model can over-generalize that into
+    stopping early on long calls too. See
+    _downweight_short_target_eos()/README's "Short-target end-of-sequence
+    down-weighting". The target's own content tokens are untouched --
+    only the closing tail is affected.
     """
     if on_long_example not in ("drop", "truncate"):
         raise ValueError(f"on_long_example must be 'drop' or 'truncate', got {on_long_example!r}")
@@ -652,6 +707,20 @@ def build_example(
             mask_corpus_freq, mask_max_common_freq, recoverable_correction_weight,
         )
 
+    # Disjoint from the two spans above by construction -- this only ever
+    # touches positions *after* the target's own content tokens (the
+    # closing end-of-turn tail), which recoverable-correction/low-signal
+    # spans, computed from target_text's own characters, never reach.
+    short_target_downweighted_tokens = 0
+    if (
+        short_target_eos_weight != 1.0
+        and status != "dropped"
+        and len(target_text.split()) <= short_target_max_words
+    ):
+        short_target_downweighted_tokens = _downweight_short_target_eos(
+            tokenizer, target_text, kept_ids, token_weights, len(prompt_ids), short_target_eos_weight,
+        )
+
     return {
         "input_ids": kept_ids,
         "attention_mask": [1] * len(kept_ids),
@@ -660,6 +729,7 @@ def build_example(
         "status": status,
         "masked_low_signal_tokens": masked_low_signal_tokens,
         "weighted_recoverable_tokens": weighted_recoverable_tokens,
+        "short_target_downweighted_tokens": short_target_downweighted_tokens,
     }
 
 

@@ -34,6 +34,7 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "save_steps",
         "save_total_limit",
         "seed",
+        "early_stopping_patience",
     },
     "lora": {"r": "lora_r", "alpha": "lora_alpha", "dropout": "lora_dropout"},
     "quantization": {"load_in_4bit"},
@@ -63,6 +64,8 @@ _SECTIONS: dict[str, set[str] | dict[str, str]] = {
         "entity_row_type": "test_entity_row_type",
         "typo_row_type": "test_typo_row_type",
         "fix_weight": "test_fix_weight",
+        "premature_stop_ratio": "test_premature_stop_ratio",
+        "premature_stop_min_input_words": "test_premature_stop_min_input_words",
     },
 }
 
@@ -159,6 +162,49 @@ class Config:
     # word (see word_correction_categories()). Independent of
     # mask_low_signal_corrections -- either can be on without the other.
     recoverable_correction_weight: float = 1.0
+    # Multiplies the per-token loss for the target's trailing end-of-turn
+    # token(s) -- whatever the chat template appends after the target
+    # content itself (e.g. Qwen's "<|im_end|>\n") -- when the target itself
+    # is short (<= short_target_max_words words). See data.py's
+    # build_example()/_downweight_short_target_eos() and README's
+    # "Short-target end-of-sequence down-weighting". 1.0 (the default) is a
+    # no-op, same convention as recoverable_correction_weight, and shares
+    # its WeightedLossTrainer (train.py uses it when either weight != 1.0).
+    #
+    # Motivated by a real fine-tuning-induced failure, found by inspecting
+    # qwen3.5-2b-50pct-masked-weighted's final-checkpoint predictions: the
+    # model stopped generating early on 10.5% of the main test set (1,978
+    # rows), 82.7% of those right after the word "بله" -- vs. 0.6% of the
+    # same rows at the pre-training baseline, i.e. something fine-tuning
+    # taught, not a pre-existing model quirk. Traced to the training data:
+    # 1,275 rows (0.7% of the curated set) are short (<=20-word) targets
+    # whose call genuinely ends right after "بله" -- a correct label, but
+    # its "greeting-and-agreement flow -> stop" shape is structurally
+    # identical to the *opening* of nearly every call, short or long. With
+    # only ~0.7% of rows carrying a "stop here" signal at a position that
+    # recurs near-universally, the model over-generalized it to calls that
+    # don't actually end there. This down-weights (not masks -- some signal
+    # for genuinely short calls is still wanted) only the closing
+    # end-of-turn token(s) on those specific short rows; the target's real
+    # content tokens (e.g. "بله" itself) still train at normal weight.
+    #
+    # Deliberately keyed on target length alone, not on ending with "بله"
+    # specifically -- hard-coding one word would be fragile (any short
+    # call's closing phrase risks the same structural collision with other
+    # calls' openings, not just this one), and the actual affected
+    # population under this broader rule is 5.14% of the curated training
+    # set (9,444/183,880 rows with a target <= short_target_max_words
+    # words), not just the 0.7% that happen to end in "بله" -- verified
+    # directly against data/asr_dataset_curated.jsonl.
+    short_target_eos_weight: float = 1.0
+    # Word-count threshold below which a target counts as "short" for
+    # short_target_eos_weight above -- see its docstring. 20 was chosen by
+    # inspecting the "بله"-ending subset specifically (of those, <= 20 words
+    # reads as a short opening/closing exchange; longer ones are calls that
+    # legitimately run on before ending there) and then applied as a general
+    # cutoff to every row regardless of ending word -- not separately tuned
+    # against the full 5.14%-of-rows population it actually affects.
+    short_target_max_words: int = 20
 
     num_train_epochs: float = 3.0
     per_device_train_batch_size: int = 4
@@ -175,6 +221,18 @@ class Config:
     save_steps: int = 200
     save_total_limit: int | None = 3
     seed: int = 42
+    # Stops training once best-checkpoint WER (see update_best_checkpoint(),
+    # tracked in TestEvalCallback the same way regardless of this setting)
+    # hasn't improved for this many consecutive checkpoint saves. null (the
+    # default) never stops early -- unchanged behavior. Counts only saves
+    # where a WER was actually available to compare (main test set, or the
+    # entity/typo fallback when test_checkpoint_eval_main is off) -- a save
+    # with no eval at all doesn't count against patience. Since
+    # save_steps/eval_steps sets the checkpoint cadence, patience in
+    # checkpoints times save_steps gives the number of training steps a
+    # plateau is allowed to run before stopping -- e.g. patience=3 with
+    # save_steps=1000 stops after 3000 steps without a new best.
+    early_stopping_patience: int | None = None
 
     lora_r: int = 16
     lora_alpha: int = 32
@@ -284,6 +342,25 @@ class Config:
     # reference. Independent of wer/exact_match, which only compare against
     # the reference and can't tell "wrong correction" from "invented content".
     test_hallucination_overlap_floor: float = 50.0
+    # A prediction is flagged "premature_stop" (predictions.jsonl +
+    # test_premature_stop_rate) when its own word count is under this
+    # fraction of test_input_column's word count -- the opposite failure
+    # mode from hallucination (under-generation instead of over-generation):
+    # the model stops before actually correcting the rest of the call.
+    # Independent of wer/exact_match for the same reason hallucination_rate
+    # is -- a short output can still score a middling WER on a short
+    # reference, so this reports it directly as its own axis. Only checked
+    # when the input has at least test_premature_stop_min_input_words words,
+    # so a genuinely short call (a real short output is expected there)
+    # never gets flagged. Both defaults come directly from this project's own
+    # training data: manually checking data/asr_dataset_curated.jsonl found
+    # *zero* of 183,880 rows with a target under 30% of its Whisper input's
+    # length, so a prediction that short on an input this long is reliably a
+    # generation failure here, not a plausible real correction shape -- see
+    # README's "Short-target end-of-sequence down-weighting" for the
+    # training-side cause this is meant to catch regressions on.
+    test_premature_stop_ratio: float = 0.3
+    test_premature_stop_min_input_words: int = 30
     # Greedy decoding (test generation uses do_sample=False) is prone to a
     # degenerate failure: once a short, locally-high-probability phrase
     # repeats a couple times -- e.g. this task's real "بله" (yes)

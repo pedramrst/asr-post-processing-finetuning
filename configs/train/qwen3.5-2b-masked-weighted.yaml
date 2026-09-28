@@ -4,8 +4,16 @@
 # Config.recoverable_correction_weight. Everything else identical to both
 # other configs in this series.
 #
-# 3.0 here is a starting point (illustrative, not tuned) -- up-weights every
-# recoverable-correction target token to 3x normal loss weight.
+# 2.0 here (down from an earlier 3.0) -- up-weights every recoverable-
+# correction target token to 2x normal loss weight. Lowered after the
+# qwen3.5-2b-50pct-masked-weighted run (Hub folder of that name) showed
+# train/grad_norm and train/loss oscillating throughout training (not
+# damping over time) and test/entity_hallucination_rate spiking to ~13-18%
+# around steps 3000-5000 before only partially recovering -- consistent
+# with high batch-to-batch gradient variance from a small per-device batch
+# (2) combined with a heavy 3x weight on a token subset whose count varies
+# a lot per batch (entity-row upsampling + weighting compounding). 2.0
+# reduces that disparity; still illustrative, not itself tuned.
 #
 # Run this after comparing qwen3.5-2b.yaml vs. qwen3.5-2b-masked.yaml, not
 # instead of that comparison -- if masking alone already moved
@@ -23,12 +31,21 @@
 #   ./run.sh train qwen3.5-2b --set recoverable_correction_weight=3.0 \
 #     --set output_dir=./outputs/qwen3.5-2b-weighted
 #
-# Batch size: per-device 2 with gradient_accumulation 8 (effective batch
-# size 16). Measured, not estimated -- per-device 4 was tried first (a
-# hoped-for throughput improvement) and OOM'd on a 32GB RTX 5090, so this was
-# reverted back to 2. Revisit raising it again only after separately testing
-# use_unsloth and/or quantization.load_in_4bit, both of which free up real
-# VRAM and haven't been tried yet.
+# Batch size: per-device 2 with gradient_accumulation 16 (effective batch
+# size 32, up from 16). Per-device stays 2 -- per-device 4 was tried first (a
+# hoped-for throughput improvement) and OOM'd on a 32GB RTX 5090, and
+# quantization.load_in_4bit / use_unsloth are both off the table for now (4-bit
+# risks quality on a small 2B model in Persian; Unsloth's LoRA path misses
+# Qwen3.5's linear-attention projection names -- see the Unsloth note above
+# and README's "Unsloth"). gradient_accumulation_steps doubled instead, same
+# per-device memory footprint, more rows averaged into each optimizer step --
+# the other half of addressing the grad_norm/loss oscillation noted above
+# (this averages out per-batch variance directly; the lower weight above
+# reduces its source). Doubling this halves the number of optimizer steps for
+# the same epoch count -- warmup_ratio/lr_scheduler_type below are fraction-
+# of-total-steps based, so they scale automatically; save_steps/eval_steps
+# (below, overridden by sweep.yaml to 1000) now span roughly 2x the wall-clock
+# per checkpoint.
 
 
 model_id: Qwen/Qwen3.5-2B
@@ -52,7 +69,23 @@ on_long_example: drop   # drop | truncate
 mask_low_signal_corrections: true
 mask_min_similarity: 0.75
 mask_max_common_freq: 1
-recoverable_correction_weight: 3.0
+recoverable_correction_weight: 2.0
+
+# New for v2 -- see Config.short_target_eos_weight's docstring and README's
+# "Short-target end-of-sequence down-weighting". Down-weights the closing
+# end-of-turn token(s) of any target <= short_target_max_words words to
+# 0.3x normal loss weight, to counter a real fine-tuning-induced failure
+# found in qwen3.5-2b-50pct-masked-weighted's final-checkpoint predictions:
+# the model stopped generating early on 10.5% of the main test set (usually
+# right after a call's opening greeting), vs. 0.6% at the pre-training
+# baseline on the same rows. Traced to short training rows whose call
+# genuinely ends right after a short phrase -- a correct label, but
+# structurally identical to the *opening* of almost every call. Watch
+# test_premature_stop_rate (new this run, see README's "Test-set
+# evaluation") on entity/typo/main-set curves to see whether this actually
+# helps -- 0.3 here is a starting point, not tuned.
+short_target_eos_weight: 0.3
+short_target_max_words: 20
 
 training:
   # 2, not 3 -- see base.yaml's comment: extra epochs risk overfitting,
@@ -60,7 +93,7 @@ training:
   num_train_epochs: 2.0
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 16
   learning_rate: 1.0e-4
   warmup_ratio: 0.05   # within the commonly recommended 5-10% of steps
   logging_steps: 10
@@ -68,6 +101,15 @@ training:
   save_steps: 100
   save_total_limit: 3
   seed: 42
+  # Stops the run once the best-checkpoint WER (see README's "best checkpoint
+  # by WER", update_best_checkpoint()) hasn't improved for this many
+  # consecutive checkpoint saves. The qwen3.5-2b-50pct-masked-weighted run
+  # (best_wer=0.223 at step 2000 of 11146, weight=1.0's) never improved on
+  # that again across the remaining 9 checkpoints -- a patience this low
+  # would have stopped that run ~8000 steps earlier. In checkpoint-cadence
+  # terms, not steps: with sweep.yaml's save_steps=1000 override, patience=3
+  # means stopping after 3000 steps without a new best.
+  early_stopping_patience: 3
 
 lora:
   r: 32   # up from 16 -- alpha doubled alongside it to keep the alpha/r=2 scale unchanged

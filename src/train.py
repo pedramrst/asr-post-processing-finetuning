@@ -142,13 +142,13 @@ class WeightedLossTrainer(Trainer):
     """Trainer subclass that multiplies each target token's loss by a
     per-token weight (batch key "token_weights", built by
     data.py's build_example()/PadCollator from Config.
-    recoverable_correction_weight) instead of the model's default uniform
-    cross-entropy.
+    recoverable_correction_weight and/or Config.short_target_eos_weight)
+    instead of the model's default uniform cross-entropy.
 
-    Only ever constructed when that weight isn't 1.0 (see main(), below) --
-    a run that doesn't use this feature gets the plain `Trainer` untouched,
-    so this class existing changes nothing about the already-working default
-    path.
+    Only ever constructed when at least one of those two weights isn't 1.0
+    (see main(), below, `uses_token_weights`) -- a run that doesn't use
+    either feature gets the plain `Trainer` untouched, so this class
+    existing changes nothing about the already-working default path.
 
     Recomputes the causal-LM shift-and-cross-entropy by hand instead of
     letting the model compute its own loss from `labels`:
@@ -432,6 +432,8 @@ def main() -> None:
             mask_corpus_freq=word_category_corpus_freq,
             mask_max_common_freq=cfg.mask_max_common_freq,
             recoverable_correction_weight=cfg.recoverable_correction_weight,
+            short_target_eos_weight=cfg.short_target_eos_weight,
+            short_target_max_words=cfg.short_target_max_words,
         )
 
     tokenized = raw.map(_map, remove_columns=raw["train"].column_names)
@@ -443,6 +445,7 @@ def main() -> None:
     length_stats = Counter()
     masked_low_signal_tokens_total = masked_low_signal_examples = 0
     weighted_recoverable_tokens_total = weighted_recoverable_examples = 0
+    short_target_downweighted_tokens_total = short_target_downweighted_examples = 0
     for split_ds in tokenized.values():
         length_stats.update(split_ds["status"])
         masked = split_ds["masked_low_signal_tokens"]
@@ -451,6 +454,9 @@ def main() -> None:
         weighted = split_ds["weighted_recoverable_tokens"]
         weighted_recoverable_tokens_total += sum(weighted)
         weighted_recoverable_examples += sum(1 for n in weighted if n)
+        short_downweighted = split_ds["short_target_downweighted_tokens"]
+        short_target_downweighted_tokens_total += sum(short_downweighted)
+        short_target_downweighted_examples += sum(1 for n in short_downweighted if n)
 
     n_total = sum(length_stats.values())
     print(
@@ -471,15 +477,27 @@ def main() -> None:
             f"{weighted_recoverable_tokens_total} target tokens up-weighted across "
             f"{weighted_recoverable_examples} examples"
         )
+    if cfg.short_target_eos_weight != 1.0:
+        print(
+            f"Short-target EOS down-weighting (max_words={cfg.short_target_max_words}, "
+            f"weight={cfg.short_target_eos_weight}): "
+            f"{short_target_downweighted_tokens_total} end-of-turn tokens down-weighted across "
+            f"{short_target_downweighted_examples} examples"
+        )
     if length_stats["dropped"]:
         tokenized = tokenized.filter(lambda ex: ex["status"] != "dropped")
-    tokenized = tokenized.remove_columns(["status", "masked_low_signal_tokens", "weighted_recoverable_tokens"])
-    if cfg.recoverable_correction_weight == 1.0:
+    tokenized = tokenized.remove_columns(
+        ["status", "masked_low_signal_tokens", "weighted_recoverable_tokens", "short_target_downweighted_tokens"]
+    )
+    # Either weight feature makes token_weights meaningful -- see
+    # WeightedLossTrainer's docstring.
+    uses_token_weights = cfg.recoverable_correction_weight != 1.0 or cfg.short_target_eos_weight != 1.0
+    if not uses_token_weights:
         tokenized = tokenized.remove_columns(["token_weights"])
 
     collator = PadCollator(
         pad_token_id=tokenizer.pad_token_id,
-        include_token_weights=cfg.recoverable_correction_weight != 1.0,
+        include_token_weights=uses_token_weights,
     )
 
     has_eval = "validation" in tokenized
@@ -543,9 +561,9 @@ def main() -> None:
         callbacks.append(SyncToHubCallback(cfg))
 
     # WeightedLossTrainer only when actually needed -- see its docstring --
-    # so the default (weight 1.0 everywhere) path is the plain `Trainer`,
-    # unchanged by this feature existing.
-    trainer_cls = WeightedLossTrainer if cfg.recoverable_correction_weight != 1.0 else Trainer
+    # so the default (both weights 1.0) path is the plain `Trainer`,
+    # unchanged by either feature existing.
+    trainer_cls = WeightedLossTrainer if uses_token_weights else Trainer
     trainer = trainer_cls(
         model=model,
         args=training_args,
@@ -579,6 +597,8 @@ def main() -> None:
             batch_size=cfg.test_batch_size,
             max_examples=cfg.test_max_examples,
             hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+            premature_stop_ratio=cfg.test_premature_stop_ratio,
+            premature_stop_min_input_words=cfg.test_premature_stop_min_input_words,
             repetition_penalty=cfg.test_repetition_penalty,
             no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
             fix_weight=cfg.test_fix_weight,
@@ -620,6 +640,8 @@ def main() -> None:
             batch_size=cfg.test_batch_size,
             max_examples=cfg.test_max_examples,
             hallucination_overlap_floor=cfg.test_hallucination_overlap_floor,
+            premature_stop_ratio=cfg.test_premature_stop_ratio,
+            premature_stop_min_input_words=cfg.test_premature_stop_min_input_words,
             repetition_penalty=cfg.test_repetition_penalty,
             no_repeat_ngram_size=cfg.test_no_repeat_ngram_size,
             fix_weight=cfg.test_fix_weight,

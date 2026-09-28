@@ -59,14 +59,17 @@
 #
 # Hub folder safety: PedramR/ASR_Post-processing (the shared Hub repo the
 # config's hub.repo_id points at) already has real run data under
-# qwen3.5-2b/ and gemma-3-1b-it/ (verified directly via the Hub API before
-# writing this) -- NOT to be overwritten. hub.folder is left unset here on
-# purpose: run_sweep.py auto-namespaces it to each job's own `name` below
-# when not overridden, so this job lands in a new
-# qwen3.5-2b-50pct-masked-weighted/ folder in the same repo instead of
-# colliding with the existing ones. Don't rename this job to "qwen3.5-2b" or
-# "gemma-3-1b-it" without also setting hub.folder explicitly to something
-# that isn't already in the repo.
+# qwen3.5-2b/, gemma-3-1b-it/, and qwen3.5-2b-50pct-masked-weighted/ (the
+# first pass at this same job, gradient_accumulation_steps=8 and
+# recoverable_correction_weight=3.0 -- verified directly via the Hub API
+# before writing this) -- NOT to be overwritten. This job is named
+# qwen3.5-2b-50pct-masked-weighted-v2 specifically so it doesn't collide with
+# that folder. hub.folder is left unset here on purpose: run_sweep.py
+# auto-namespaces it to each job's own `name` below when not overridden, so
+# this job lands in a new qwen3.5-2b-50pct-masked-weighted-v2/ folder in the
+# same repo. Don't rename this job to "qwen3.5-2b", "gemma-3-1b-it", or
+# "qwen3.5-2b-50pct-masked-weighted" without also setting hub.folder
+# explicitly to something that isn't already in the repo.
 #
 # output_dir/tensorboard.logging_dir are also always auto-namespaced per job
 # under output_root, the same way, unless a job's `overrides` sets them.
@@ -82,7 +85,7 @@ output_root: ./outputs/qwen-mask-weighted
 followup: false
 
 jobs:
-  - name: qwen3.5-2b-50pct-masked-weighted
+  - name: qwen3.5-2b-50pct-masked-weighted-v2
     config: configs/train/qwen3.5-2b-masked-weighted.yaml
     overrides:
       train_fraction: 0.5
