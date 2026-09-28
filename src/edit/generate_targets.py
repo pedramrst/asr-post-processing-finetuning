@@ -153,7 +153,9 @@ def select(args, out: Path) -> tuple[list[dict], list[dict]]:
         for s, e, inside in cut_windows(row, by_row[row_id], args.window_words_min, args.window_words_max, rng_row):
             if any(d["stratum"] in SKIP_WINDOW_STRATA for d in inside):
                 continue
-            to_judge = [d for d in inside if d["stratum"] in SUBSTITUTION_STRATA]
+            # kind check too: an insertion whose Soniox side is a CRM name is
+            # stratum "entity", but insertions are out of scope for v1.
+            to_judge = [d for d in inside if d["stratum"] in SUBSTITUTION_STRATA and d["kind"] == "substitute"]
             w = {"window_id": f"{row_id}:{s}", "row_id": row_id, "call_id": row["call_id"], "start": s, "end": e,
                  "crm_names": row["crm_names"], "judge_ids": [d["id"] for d in to_judge],
                  "has_entity": any(d["stratum"] == "entity" for d in to_judge), "_diffs": to_judge}

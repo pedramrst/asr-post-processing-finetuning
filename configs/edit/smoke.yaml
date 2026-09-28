@@ -1,0 +1,20 @@
+# Tiny end-to-end check of src/edit/train_edit.py: a few training steps, then
+# the full evaluation path on 20 test transcripts. Nothing is pushed.
+#   python3 src/edit/train_edit.py --config configs/edit/smoke.yaml
+model_id: Qwen/Qwen3.5-2B
+output_dir: ./outputs/edit-smoke
+
+data:
+  sources: [PedramR/ASR_Post-processing-edit-dataset]
+  train_fraction: 0.05
+
+training:
+  max_steps: 10
+  eval_steps: 5
+  save_steps: 5
+
+hub:
+  push_to_hub: false
+
+eval:
+  max_examples: 20

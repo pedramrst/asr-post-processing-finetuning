@@ -1,0 +1,16 @@
+# Sweep queue for the edit-based method. run_sweep.py drives train_edit.py the
+# same way it drives train.py (only `--config <resolved job config>` is passed):
+#   python3 src/run_sweep.py --sweep configs/edit/sweep.yaml --train_script src/edit/train_edit.py
+#   ./run.sh sweep configs/edit/sweep.yaml --train_script src/edit/train_edit.py
+# Each job's output_dir, tensorboard dir and hub.folder are namespaced to its
+# `name` by run_sweep.py; names start with "edit-" so they never collide with
+# the rewrite runs' folders in the shared Hub repo.
+
+output_root: ./outputs/edit-sweep
+# The follow-up run resumes the winner with train.py's resume semantics,
+# which train_edit.py doesn't implement.
+followup: false
+
+jobs:
+  - name: edit-qwen3.5-2b
+    config: configs/edit/qwen3.5-2b-edit.yaml

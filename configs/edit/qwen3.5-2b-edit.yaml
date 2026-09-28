@@ -1,0 +1,40 @@
+# Edit-based correction model (src/edit/train_edit.py) -- see src/edit/README.md.
+# Keys not set here take train_edit.py's DEFAULTS; unknown keys are an error.
+model_id: Qwen/Qwen3.5-2B
+output_dir: ./outputs/edit-qwen3.5-2b
+max_length: 1024          # examples are ~500 tokens (max ~590 measured) at <= 80-word windows
+
+data:
+  # generate_targets.py's two runs, published as one Hub dataset (train/validation
+  # splits, by call) by src/edit/publish_edit_dataset.py -- so a GPU instance
+  # doesn't need the local outputs/. Locally, the train.jsonl paths work too:
+  #   sources: [outputs/edit/data/train.jsonl, outputs/edit/data_v2/train.jsonl]
+  sources: [PedramR/ASR_Post-processing-edit-dataset]
+  min_window_words: 10     # drops the 109 one-to-nine-word windows (short rows)
+  target_includes_original: true
+
+training:
+  num_train_epochs: 3.0    # ~2,780 windows / effective batch 16 = ~175 steps per epoch
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05
+  eval_steps: 50           # eval_loss on the 144 validation windows; best checkpoint kept
+  save_steps: 50
+  save_total_limit: 2
+
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0.05
+
+hub:
+  push_to_hub: true
+  repo_id: PedramR/ASR_Post-processing
+  folder: edit-qwen3.5-2b  # new folder next to the rewrite runs; nothing existing is overwritten
+
+eval:
+  batch_size: 32
+  max_new_tokens: 128      # edit lists are short (median 9 tokens, max ~60 in training)
+  baseline: false          # the untrained model doesn't know the edit format

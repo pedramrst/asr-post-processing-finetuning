@@ -21,6 +21,7 @@ at the repo root.
 | `rules.py` | model-free fixes for glued words and stutter-doubled letters |
 | `diff_filter_baseline.py` | step 1 (below) |
 | `build_diffs.py`, `llm_judge.py`, `make_label_sheet.py`, `calibrate.py`, `generate_targets.py` | step 2: differences, LLM judges, hand-labelling pages, judge calibration, training windows |
+| `edit_format.py`, `windowing.py`, `train_edit.py`, `publish_edit_dataset.py` | step 3: the model's input/output format, whole-transcript inference over overlapping windows, training + evaluation, publishing the training windows |
 | `corpus.py`, `normalize.py` | shared helpers: corpus word frequencies; punctuation stripping and style-only detection |
 
 Scripts are run from the repo root, e.g. `python3 src/edit/diff_filter_baseline.py`.
@@ -203,13 +204,51 @@ the second pool from calls not used before):
 are under 20 words (rows that are short themselves); the 109 under 10 words
 add little and are meant to be filtered at training time.
 
+## Step 3: the edit model (`train_edit.py`)
+
+LoRA SFT of Qwen3.5-2B on the training windows. Format (`edit_format.py`):
+
+```text
+user:       Known names: نمونه‌پور، مریم
+            [1]سلام [2]خانم [3]نمونپور [4]وقت [5]بخیر ...
+assistant:  3 نمونپور → نمونه‌پور
+            12-13 به سطح → بسته‌ت رو        (or NONE)
+```
+
+Word numbers are 1-based and ranges inclusive. Repeating the original words
+(`data.target_includes_original`, on by default) costs a few tokens but lets
+`parse_edits` reject a line whose numbers point at different words, instead
+of corrupting the transcript. Lines that don't parse, fall outside the
+window, overlap, or delete words are rejected and counted, never applied.
+
+Inference on a whole transcript (`windowing.py`): `rules.py` first, then
+50-word windows every 25 words; each word is owned by the one window where
+it sits in the middle, so it's decided with at least 12 words of that window
+on each side; an edit is kept only from its owner window. The evaluation
+runs exactly this on the test set and scores the merged transcripts with
+`scoring.py` next to two baselines (Whisper untouched, rules only), on the
+main set and the entity/typo slices.
+
+```bash
+python3 src/edit/publish_edit_dataset.py                        # once: training windows -> private Hub dataset
+python3 src/edit/train_edit.py --config configs/edit/smoke.yaml  # few steps + eval on 20 transcripts
+python3 src/edit/train_edit.py --config configs/edit/qwen3.5-2b-edit.yaml
+python3 src/run_sweep.py --sweep configs/edit/sweep.yaml --train_script src/edit/train_edit.py
+```
+
+Outputs in `output_dir`: `test_eval/` (`metrics.json` for the model, with
+`wer` at the top for run_sweep.py; `baselines.json`; `comparison.md`;
+`predictions.jsonl` with each transcript's edits and rejected lines),
+`test_eval_entity/`, `test_eval_typo/`, and `validation_edits.json`
+(exact-match edit precision/recall on the 144 held-out windows). Its config
+schema is its own (`DEFAULTS` in `train_edit.py`, unknown keys rejected): the
+rewrite pipeline's masking/weighting options assume a full-transcript
+target. Entity metrics use Gemini labels only where `data/output-backup/`
+exists (locally); elsewhere they fall back to CRM names.
+
 ## Next steps
 
-3. **Train the edit model** (Qwen3.5-2B, LoRA) on word-indexed windows
-   (`[1]word [2]word …`) with a compact output (`12-13 → replacement` per
-   line, or `NONE`), applied after `rules.py`. Its own entry point,
-   `src/edit/train_edit.py --config …`, runnable by `src/run_sweep.py
-   --train_script` (sweep with `followup: false`). Evaluate on full test
-   transcripts via overlapping windows, scored with `scoring.py`; compare
-   against `whisper`, `rules`, and the rewrite runs.
+3. Run step 3 on a GPU and compare against `whisper`, `rules`, and the
+   rewrite runs. If edits near window edges suffer, try the read-only
+   context already stored with each window.
 4. Add a separate span detector only if false edits remain a problem.
