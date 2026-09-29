@@ -26,7 +26,7 @@ are deduplicated here):
        whisper_extra   Whisper has words Soniox has nothing for
        long            a side longer than MAX_ITEM_WORDS (likely
                        misalignment or a skipped stretch of audio)
-       style, filler, garbled   see 4 (not judged)
+       style, filler, garbled, number   see 4 (not judged)
 
 Writes <output-dir>/rows.jsonl (one per unique row: Whisper after rules,
 Soniox text, CRM names, diff counts) and <output-dir>/diffs.jsonl (one per
@@ -55,7 +55,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/, for the sh
 from tqdm import tqdm  # noqa: E402
 
 from corpus import CACHE_DIR, load_corpus_freq  # noqa: E402
-from edits import Edit, apply_edits, extract_edits  # noqa: E402
+from edits import Edit, apply_edits, changes_number, extract_edits  # noqa: E402
 from evaluate import _load_hub_columns_pruned  # noqa: E402
 from grounding import MIN_NAME_WORD_LEN, crm_candidates, span_similarity  # noqa: E402
 from normalize import is_style_edit, squash  # noqa: E402
@@ -71,7 +71,7 @@ CRM_NEAR_MIN_SIMILARITY = 0.75
 # within GARBLED_WINDOW words sits in a stretch Whisper got badly wrong: its
 # context is unreadable, so neither a person nor a text-only judge can rule
 # on it (round 1 of hand labelling). Never judged; stays Whisper's text.
-NOT_JUDGED = ("style", "filler", "garbled")
+NOT_JUDGED = ("style", "filler", "garbled", "number")
 GARBLED_WINDOW = 3
 GARBLED_MIN_NEIGHBOURS = 2
 # Filler/discourse words. A difference made only of these (a dropped "بله",
@@ -82,6 +82,10 @@ FILLER_WORDS = frozenset({
     "بله", "آره", "آها", "اها", "الو", "آه", "اه", "ام", "امم", "اممم", "خب", "خوب", "و", "رو", "را",
     "هم", "دیگه", "یعنی", "حالا", "مرسی", "ممنون", "باشه", "چشم", "نه", "آقا", "خانم", "اینکه", "که",
     "این", "اون", "یه", "یک", "ببخشید", "بفرمایید", "بفرمایین", "عرض", "حتما", "الان", "جان",
+    # Acknowledgement/interjection words beyond "بله" -- found as ordinary
+    # single-word insertions/deletions (one side transcribed the
+    # interjection, the other didn't), not caught by the words above.
+    "اوکی", "اکی", "آهان", "اهان", "اهوم", "اوهوم", "بلی", "بعله",
 })
 
 
@@ -184,7 +188,11 @@ def process_row(row: dict) -> tuple[dict, list[dict]]:
     names = crm_candidates(row.get("crm_context"))
     row_id = stable_id(row["call_id"], row["channel"], row["text_whisper"])
     rules = rule_edits(row["text_whisper"], freq, protected=names)
-    whisper = apply_edits(row["text_whisper"], rules)
+    # rules.py's own fixes are deterministic and already reviewed (see its
+    # docstring), not LLM-judged or model-generated -- allowed to touch a
+    # number (e.g. unstuttering "ببیست" -> "بیست") since they only ever
+    # remove a doubled letter or split a glued word, never change a digit.
+    whisper = apply_edits(row["text_whisper"], rules, allow_numbers=True)
     w_words = whisper.split()
     soniox = " ".join(row["text"].split())
 
@@ -194,11 +202,13 @@ def process_row(row: dict) -> tuple[dict, list[dict]]:
     edits = [piece for e in extract_edits(whisper, soniox) for piece in split_mixed(e)]
     style = [is_style_edit(e) for e in edits]
     filler = [not st and is_filler_edit(e) for e, st in zip(edits, style)]
-    content = [(e.start, e.end) for e, st, fl in zip(edits, style, filler) if not st and not fl]
+    numeric = [not st and not fl and changes_number(e.original, e.replacement)
+               for e, st, fl in zip(edits, style, filler)]
+    content = [(e.start, e.end) for e, st, fl, nm in zip(edits, style, filler, numeric) if not st and not fl and not nm]
 
     diffs = []
     counts = Counter()
-    for e, st, fl in zip(edits, style, filler):
+    for e, st, fl, nm in zip(edits, style, filler, numeric):
         sim = span_similarity(e.original, e.replacement) if e.original and e.replacement else 0.0
         crm_hit = any(w in names for w in e.replacement)
         crm_near = bool(e.original) and any(
@@ -211,6 +221,8 @@ def process_row(row: dict) -> tuple[dict, list[dict]]:
             strat = "style"
         elif fl:
             strat = "filler"
+        elif nm:
+            strat = "number"
         else:
             strat = stratum(e.kind, e.original, e.replacement, sim, crm_hit, crm_near,
                             min(s_freqs) if s_freqs else None, neighbours)

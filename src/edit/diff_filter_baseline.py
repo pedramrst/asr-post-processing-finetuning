@@ -37,6 +37,13 @@ Writes <output-dir>/<slice>/summary.json, a combined summary.md table, and
 <slice>/edits.jsonl (every extracted edit with its features and whether it
 helped or hurt on its own) for inspecting what the model actually edits.
 
+This is an exploratory, read-only comparison of methods (never feeds
+training data or production), so its apply_edits() calls pass
+allow_numbers=True throughout -- unlike every other script in this
+package, it doesn't gate on edits.py's number guard, so its "rewrite"/
+"accept all" baselines still show the raw rewrite model's behaviour,
+number changes included.
+
 Example:
   python3 src/edit/diff_filter_baseline.py
   python3 src/edit/diff_filter_baseline.py --run qwen3.5-2b --slices main
@@ -117,7 +124,7 @@ def annotate(e: Edit, candidates: set[str]) -> Edit:
 
 def edit_effect(src: str, ref: str, e: Edit, base: tuple[int, int]) -> tuple[int, int]:
     """(lenient words fixed, lenient words broken) by applying `e` alone."""
-    target, already, still, _ = lenient_positions(src, apply_edits(src, [e]), ref)
+    target, already, still, _ = lenient_positions(src, apply_edits(src, [e], allow_numbers=True), ref)
     return len(target & still) - base[0], base[1] - len(already & still)
 
 
@@ -169,7 +176,7 @@ def run_slice(name, rows, corpus_freq, test_by_whisper, gemini, out_dir: Path) -
         for src, out, ref, cands in tqdm(list(zip(sources, outputs, references, candidates)),
                                          desc=f"{name}: edits", leave=False):
             edits = [annotate(e, cands) for e in extract_edits(src, out)]
-            assert apply_edits(src, edits).split() == out.split(), "edit round-trip failed"
+            assert apply_edits(src, edits, allow_numbers=True).split() == out.split(), "edit round-trip failed"
             target, already, still, _ = lenient_positions(src, src, ref)
             base = (len(target & still), len(already & still))
             for e in edits:
@@ -182,7 +189,7 @@ def run_slice(name, rows, corpus_freq, test_by_whisper, gemini, out_dir: Path) -
     # The model's rewrite exactly as it was generated, punctuation included.
     results = {"rewrite_raw": score(sources, [r["output"] for r in rows], references, corpus_freq, entity_spans)}
     for fname, keep in FILTERS.items():
-        hyps = [apply_edits(s, [e for e in es if keep(e)]) for s, es in zip(sources, row_edits)]
+        hyps = [apply_edits(s, [e for e in es if keep(e)], allow_numbers=True) for s, es in zip(sources, row_edits)]
         results[fname] = score(sources, hyps, references, corpus_freq, entity_spans)
 
     proposers = {
@@ -208,8 +215,8 @@ def run_slice(name, rows, corpus_freq, test_by_whisper, gemini, out_dir: Path) -
             proposed = [e for p in names for e in proposers[p][i]]
             if base_filter:
                 proposed += [e for e in es if FILTERS[base_filter](e)]
-            valid, _ = validate_edits(s.split(), proposed)
-            hyps.append(apply_edits(s, valid))
+            valid, _ = validate_edits(s.split(), proposed, allow_numbers=True)
+            hyps.append(apply_edits(s, valid, allow_numbers=True))
         results[fname] = score(sources, hyps, references, corpus_freq, entity_spans)
 
     all_edits = [e for es in row_edits for e in es]

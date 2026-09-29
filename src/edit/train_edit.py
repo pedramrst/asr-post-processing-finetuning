@@ -200,7 +200,9 @@ def load_test_set(cfg) -> SimpleNamespace:
     refs = [r["text"] for r in rows]
     return SimpleNamespace(
         rows=rows, slices={k: sorted(v) for k, v in slices.items()}, freq=freq, names=names, whisper=whisper,
-        after_rules=[apply_edits(w, rule_edits(w, freq, protected=set(n))) for w, n in zip(whisper, names)],
+        # allow_numbers: same rules.py preprocessing as build_diffs.py -- see its comment.
+        after_rules=[apply_edits(w, rule_edits(w, freq, protected=set(n)), allow_numbers=True)
+                    for w, n in zip(whisper, names)],
         refs=refs,
         spans=[reference_entity_spans(ref, set(n), gemini.get(r["call_id"], [])) for ref, n, r in zip(refs, names, rows)],
     )

@@ -17,6 +17,11 @@ On top of those, the metrics the edit method is actually judged on
   * broken_per_100_correct: new errors per 100 words Whisper already had
     right -- the "false edits on clean text" number.
   * rows_changed: fraction of transcripts touched at all.
+  * *_clitic: WER and fixed/broken/net counts after joining separate
+    clitics on every side (normalize.join_clitics) -- so a change that only
+    respells a clitic the way Soniox does ("همینو" -> "همین رو") no longer
+    counts as a fix. The verifier audit showed such changes make up most of
+    what the plain metrics credit to accepting every rewrite candidate.
   * entity metrics against reference entity spans (CRM names + Gemini
     extractions, see grounding.reference_entity_spans): of the entity spans
     Whisper got wrong, how many the correction recovered (entity_fix_rate);
@@ -40,6 +45,7 @@ from evaluate import (  # noqa: E402
     _word_overlap_pct,
 )
 from persian_normalize import normalize_lenient  # noqa: E402
+from normalize import normalize_clitics  # noqa: E402
 
 HALLUCINATION_OVERLAP_FLOOR = 50.0  # evaluate.py's default
 FIX_WEIGHT = 0.5  # evaluate.py's default
@@ -95,6 +101,9 @@ def score(
     fix_h = fix_t = keep_h = keep_t = 0
     fix_hl = fix_tl = keep_hl = keep_tl = 0
     fix_hr = fix_tr = unrecoverable = 0
+    fix_hc = keep_hc = keep_tc = 0
+    clitic = [(normalize_clitics(s_), normalize_clitics(h_), normalize_clitics(r_))
+              for s_, h_, r_ in zip(sources, hypotheses, references)]
     ent_fix_h = ent_fix_t = ent_keep_h = ent_keep_t = 0
     for i, (src, hyp, ref) in enumerate(zip(sources, hypotheses, references)):
         # Strict (byte-exact) buckets -- evaluate.py's fix_rate/preservation_rate.
@@ -111,6 +120,13 @@ def score(
         fix_tl += len(target_l)
         keep_hl += len(already_l & still_l)
         keep_tl += len(already_l)
+
+        # Same buckets after joining separate clitics (normalize.join_clitics),
+        # so "همین رو" and "همینو" count as the same word on every side.
+        target_c, already_c, still_c, _ = lenient_positions(*clitic[i])
+        fix_hc += len(target_c & still_c)
+        keep_hc += len(already_c & still_c)
+        keep_tc += len(already_c)
 
         if corpus_freq is not None:
             bad = set()
@@ -147,6 +163,14 @@ def score(
     m["broken_lenient"] = keep_tl - keep_hl
     m["net_fixed_lenient"] = fix_hl - (keep_tl - keep_hl)
     m["broken_per_100_correct"] = 100 * (keep_tl - keep_hl) / keep_tl if keep_tl else None
+    # clitic-normalized counterparts: a change that only splits or joins a
+    # clitic (e.g. to Soniox's spelling) is neither a fix nor a break here
+    m["wer_clitic"] = jiwer.process_words([normalize_lenient(r) for _, _, r in clitic],
+                                          [normalize_lenient(h) for _, h, _ in clitic]).wer
+    m["fixed_clitic"] = fix_hc
+    m["broken_clitic"] = keep_tc - keep_hc
+    m["net_fixed_clitic"] = fix_hc - (keep_tc - keep_hc)
+    m["broken_per_100_correct_clitic"] = 100 * (keep_tc - keep_hc) / keep_tc if keep_tc else None
     if corpus_freq is not None:
         m["fix_rate_recoverable"] = ratio(fix_hr, fix_tr)
         m["unrecoverable_targets"] = unrecoverable

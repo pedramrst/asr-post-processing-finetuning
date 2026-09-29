@@ -44,7 +44,7 @@ from dotenv import load_dotenv  # noqa: E402
 from huggingface_hub import hf_hub_download  # noqa: E402
 
 from build_diffs import is_filler_edit  # noqa: E402
-from edits import Edit, apply_edits, extract_edits, validate_edits  # noqa: E402
+from edits import Edit, apply_edits, changes_number, extract_edits, validate_edits  # noqa: E402
 from hub_sync import sync_output_dir  # noqa: E402
 from hub_utils import ensure_new_folder, upload_new_folder  # noqa: E402
 from normalize import is_style_edit, strip_punctuation  # noqa: E402
@@ -180,12 +180,14 @@ def extract_candidates(after_rules: str, rewrite_output: str, names: list[str], 
                        max_span_words: int) -> list[dict]:
     """The rewrite model's changes to the (rules-fixed) Whisper text, as
     verifier items: substitutions of <= max_span_words words that aren't
-    only a spelling/dialect variant or filler words."""
+    only a spelling/dialect variant or filler words, and never a number
+    (touches_number -- these are never applied regardless, see edits.py)."""
     words = after_rules.split()
     out = []
     for e in extract_edits(after_rules, strip_punctuation(rewrite_output)):
         if (e.kind != "substitute" or max(len(e.original), len(e.replacement)) > max_span_words
-                or is_style_edit(e) or is_filler_edit(e)):
+                or is_style_edit(e) or is_filler_edit(e)
+                or changes_number(e.original, e.replacement)):
             continue
         out.append({"start": e.start, "end": e.end, "original": " ".join(e.original), "proposed": " ".join(e.replacement),
                     "left": " ".join(words[max(0, e.start - context_words):e.start]),
@@ -241,8 +243,8 @@ def evaluate_candidates(cfg, scorer, out_dir: Path) -> dict:
         methods[f"verifier@{e.threshold}"] = lambda c: c["p_yes"] >= e.threshold
     hyps = {m: [apply_accepted(ts.after_rules[i], cands[i], keep) for i in range(len(ts.rows))] for m, keep in methods.items()}
 
-    table = ["| slice | method | WER | fixed | broken | net | broken/100 | entity fix | accepted |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    table = ["| slice | method | WER | WER (clitic) | fixed | broken | net | net (clitic) | broken/100 | entity fix | accepted |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
     results = {}
     for name, idx in ts.slices.items():
         pick = lambda xs: [xs[i] for i in idx]  # noqa: E731
@@ -252,9 +254,9 @@ def evaluate_candidates(cfg, scorer, out_dir: Path) -> dict:
             s = score(pick(ts.whisper), pick(h), pick(ts.refs), ts.freq, pick(ts.spans))
             s["accepted"] = 0 if keep is None else sum(keep(c) for i in idx for c in cands[i])
             results[name][m] = s
-            table.append(f"| {name} | {m} | {s['wer']:.4f} | {s['fixed_lenient']} | {s['broken_lenient']} | "
-                         f"{s['net_fixed_lenient']} | {s['broken_per_100_correct']:.2f} | "
-                         f"{(s.get('entity_fix_rate') or 0):.3f} | {s['accepted']} |")
+            table.append(f"| {name} | {m} | {s['wer']:.4f} | {s['wer_clitic']:.4f} | {s['fixed_lenient']} | "
+                         f"{s['broken_lenient']} | {s['net_fixed_lenient']} | {s['net_fixed_clitic']} | "
+                         f"{s['broken_per_100_correct']:.2f} | {(s.get('entity_fix_rate') or 0):.3f} | {s['accepted']} |")
         slice_dir = out_dir / ("test_eval" if name == "main" else f"test_eval_{name}")
         slice_dir.mkdir(parents=True, exist_ok=True)
         (slice_dir / "metrics.json").write_text(json.dumps(results[name][f"verifier@{e.threshold}"], indent=2))

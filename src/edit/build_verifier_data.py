@@ -41,6 +41,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/, for the shared modules
 
 from calibrate import merge_labels  # noqa: E402
+from edits import changes_number  # noqa: E402
 from generate_targets import CHEAP_JUDGE, MAIN_JUDGE, decide  # noqa: E402
 from llm_judge import cache_path, load_cache, to_label  # noqa: E402
 
@@ -83,6 +84,11 @@ def main():
         it = json.loads(line)
         if it["id"] not in human or it["kind"] != "substitute":
             continue
+        # Never a training example either way -- see edits.py's touches_number:
+        # an edit changing a number is always rejected downstream, so teaching
+        # the verifier to weigh in on one at all is out of scope.
+        if changes_number(it["whisper_span"].split(), it["soniox_span"].split()):
+            continue
         label = to_label(it, human[it["id"]]["verdict"])
         calib_calls.add(it["call_id"])
         if label == "real_error":
@@ -115,6 +121,9 @@ def main():
             continue
         if it["call_id"] in calib_calls:
             counts["skipped: call is in the calibration split"] += 1
+            continue
+        if changes_number(it["whisper_span"].split(), it["soniox_span"].split()):
+            counts["skipped: touches a number"] += 1
             continue
         status, why = decide(it, cheap, main_, {})  # hand-labelled calls are all in calibration
         if status == "undecided":

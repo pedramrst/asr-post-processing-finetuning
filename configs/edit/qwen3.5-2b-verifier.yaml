@@ -1,15 +1,17 @@
 # Edit verifier (src/edit/train_verifier.py): YES/NO on one proposed change.
 # Keys not set here take train_verifier.py's DEFAULTS; unknown keys are an error.
 model_id: Qwen/Qwen3.5-2B
-output_dir: ./outputs/verifier-qwen3.5-2b
+output_dir: ./outputs/verifier-qwen3.5-2b-v2
 max_length: 512            # examples are ~234 tokens (max ~283 measured)
 
 data:
   # build_verifier_data.py's train/validation/calibration splits, uploaded with
-  # --push-folder datasets/verifier-v1 into the shared repo, so a GPU instance
-  # doesn't need the local outputs/.
+  # --push-folder datasets/verifier-v2 into the shared repo, so a GPU instance
+  # doesn't need the local outputs/. v2: adds the number guard (edits.py's
+  # changes_number) -- 330 examples that changed a number's value were
+  # removed; see README "Never changes numbers".
   hub_repo: PedramR/ASR_Post-processing
-  hub_folder: datasets/verifier-v1
+  hub_folder: datasets/verifier-v2
 
 training:
   num_train_epochs: 2.0    # ~4,630 examples / effective batch 16 = ~290 steps per epoch
@@ -23,7 +25,7 @@ training:
 hub:
   push_to_hub: true
   repo_id: PedramR/ASR_Post-processing
-  folder: verifier-qwen3.5-2b
+  folder: verifier-qwen3.5-2b-v2   # new folder -- verifier-qwen3.5-2b (v1, no number guard) is kept as is
 
 eval:
   # Candidate edits: a rewrite run's test predictions -- the best (step-2500)

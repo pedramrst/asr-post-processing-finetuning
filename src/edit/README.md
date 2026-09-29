@@ -15,15 +15,15 @@ at the repo root.
 
 | file | what |
 |---|---|
-| `edits.py` | `Edit` (word-index span + replacement), `extract_edits` (any source/hypothesis pair -> minimal edits, via jiwer), `validate_edits`, `apply_edits` |
-| `scoring.py` | `score()`: evaluate.py's metrics computed identically (reproduces a run's `metrics.json`) plus fixed/broken counts, broken per 100 correct words, rows changed, entity fix/keep rates |
+| `edits.py` | `Edit` (word-index span + replacement), `extract_edits` (any source/hypothesis pair -> minimal edits, via jiwer), `validate_edits`, `apply_edits`; `changes_number`/`NUMBER_WORDS` (the number guard -- see "Never changes numbers") |
+| `scoring.py` | `score()`: evaluate.py's metrics computed identically (reproduces a run's `metrics.json`) plus fixed/broken counts, broken per 100 correct words, rows changed, entity fix/keep rates, and clitic/letter/number-spelling-normalized (`*_clitic`) counterparts of each |
 | `grounding.py` | inference-time CRM name candidates, `crm_snap_edits` (model-free name snapping), eval-only reference entity labels (CRM + Gemini extractions) |
 | `rules.py` | model-free fixes for glued words and stutter-doubled letters |
 | `diff_filter_baseline.py` | step 1 (below) |
 | `build_diffs.py`, `llm_judge.py`, `make_label_sheet.py`, `calibrate.py`, `generate_targets.py` | step 2: differences, LLM judges, hand-labelling pages, judge calibration, training windows |
-| `build_verifier_data.py`, `train_verifier.py` | step 4: YES/NO verifier data from the judged differences; its training and evaluation over a rewrite run's candidate edits |
+| `build_verifier_data.py`, `train_verifier.py`, `verifier_report.py`, `audit_verifier.py` | step 4: YES/NO verifier data from the judged differences; its training and evaluation over a rewrite run's candidate edits; re-scoring an uploaded run with judged precision; auditing its disagreements with the reference |
 | `edit_format.py`, `windowing.py`, `train_edit.py`, `publish_edit_dataset.py`, `decode_sweep.py` | step 3: the model's input/output format, whole-transcript inference over overlapping windows, training + evaluation, publishing the training windows |
-| `corpus.py`, `normalize.py` | shared helpers: corpus word frequencies; punctuation stripping and style-only detection |
+| `corpus.py`, `normalize.py` | shared helpers: corpus word frequencies; punctuation stripping, style-only detection (spelling/dialect/clitic/letter-variant/number-spelling equivalence -- never a value change) |
 
 Scripts are run from the repo root, e.g. `python3 src/edit/diff_filter_baseline.py`.
 Outputs go under `outputs/edit/` (gitignored).
@@ -197,13 +197,43 @@ the second pool from calls not used before):
 
 | run | windows | with edits | edits | no-edit | excluded (undecided) | cost |
 |---|---|---|---|---|---|---|
-| `outputs/edit/data` (50 words) | 1,702 | 694 | 945 | 1,008 | 298 | $2.92 |
-| `outputs/edit/data_v2` (40–80 words) | 1,328 | 597 | 910 | 731 | 232 | $3.07 |
-| **total** | **3,030** | **1,291** | **1,855** | **1,739** | | **$5.99** |
+| `outputs/edit/data` (50 words) | 1,702 | 669 | 900 | 1,033 | 298 | $2.92 |
+| `outputs/edit/data_v2` (40–80 words) | 1,328 | 582 | 873 | 746 | 232 | $3.07 |
+| **total** | **3,030** | **1,251** | **1,773** | **1,779** | | **$5.99** |
 
 2,879 train / 151 validation windows, split by call. About 8% of windows
 are under 20 words (rows that are short themselves); the 109 under 10 words
-add little and are meant to be filtered at training time.
+add little and are meant to be filtered at training time. Edit counts above
+are after the number guard (below) removed 99 edits that changed a number's
+value -- no new judging needed, since `assemble` rebuilds `train.jsonl` from
+the already-cached judge answers.
+
+### Never changes numbers
+
+An edit that would change a number's value is never applied, anywhere --
+not in training data, not by the verifier, not by a trained model's own
+output at inference. Checked directly against our first verifier run: 82 of
+1,855 edit-model edits and 99 of 4,861 verifier examples touched a number,
+and some were genuine value changes (`پانزده` (15) → `پانصد هزار`
+(500,000), `هشتصد` (800) → `هشت ساعت`), not just alignment noise -- exactly
+the mistake that's costliest to make on sensitive fields (order codes,
+amounts, tracking numbers).
+
+`edits.py`'s `changes_number` (checked against `NUMBER_WORDS`, a closed list
+of Persian cardinals/ordinals/colloquial spellings, plus a digit regex) gates
+`validate_edits` -- the one function every edit passes through before being
+applied, in training-data assembly, the verifier's candidate filter, and
+`windowing.py`'s production merge step alike. It's deliberately blunt: it
+excludes any edit touching a number-word token, not just ones that actually
+change its value, because telling those apart is exactly the judgment call
+that shouldn't be trusted here. The one exception is `rules.py`'s own
+deterministic, already-reviewed preprocessing (glue-splitting, unstuttering)
+-- `apply_edits(..., allow_numbers=True)` -- since those only ever
+re-segment the same characters (verified: squash-equal), never change one.
+`build_diffs.py` also classifies any Whisper-vs-Soniox difference touching a
+number as a new `number` stratum (never judged), and `build_verifier_data.py`
+excludes them from the verifier's training data entirely, so neither wastes
+judge calls asking a question the code will refuse the answer to anyway.
 
 ## Step 3: the edit model (`train_edit.py`)
 
@@ -283,27 +313,54 @@ edit model failed because they chose between given versions -- so the
 verifier does exactly that.
 
 - `build_verifier_data.py`: every judged Whisper-vs-Soniox substitution is a
-  YES/NO example by the calibrated rule (undecided left out): 4,628 train,
-  233 validation, and a 99-item calibration split of hand labels whose calls
-  are kept out of training.
+  YES/NO example by the calibrated rule (undecided left out), split into
+  train/validation/a calibration set of hand labels whose calls are kept out
+  of training (v2, after the number guard below: 4,376 train, 217
+  validation, 98 calibration).
 - `train_verifier.py`: LoRA SFT (same machinery as `train_edit.py`); the
   score is P(YES)/(P(YES)+P(NO)) of the first answer token. Evaluated on the
   validation/calibration splits (AUC, precision/recall per threshold) and on
   the test set with a rewrite run's predictions as candidates (substitutions,
-  no style-only or filler-only changes, <= 4 words; `premature_stop` rows
-  skipped), next to rules only, accept-all and the oracle. `--eval-only`
-  re-scores a trained verifier on other candidates.
+  no style-only, filler-only or number-changing changes, <= 4 words;
+  `premature_stop` rows skipped), next to rules only, accept-all and the
+  oracle. `--eval-only` re-scores a trained verifier on other candidates.
+- `verifier_report.py`: re-scores an already-uploaded run's test predictions
+  with the current filters (no retraining) and adds **judged precision** --
+  the WER-against-Soniox metric can't tell a real fix from one that just
+  matches Soniox's spelling, so this samples applied candidates by score bin
+  and has the calibrated judges rule on each, giving a precision estimate
+  independent of the reference.
+- `audit_verifier.py`: samples a run's disagreements with the reference
+  (rejected-but-"helpful", accepted-but-"harmful") and judges them the same
+  way, to tell whether the verifier or the reference is more often right.
 
 ```bash
-python3 src/edit/build_verifier_data.py --push-folder datasets/verifier-v1   # a new folder of the shared repo
+python3 src/edit/build_verifier_data.py --push-folder datasets/verifier-v2   # a new folder of the shared repo
 python3 src/edit/train_verifier.py --config configs/edit/qwen3.5-2b-verifier.yaml
-python3 src/edit/train_verifier.py --config configs/edit/qwen3.5-2b-verifier.yaml --eval-only \
-    --set eval.candidates_file=qwen3.5-2b-100pct-masked-weighted-v2/test_eval_best/predictions.jsonl
+python3 src/edit/verifier_report.py --run-folder verifier-qwen3.5-2b-v2
 ```
+
+### First run (v1, before the number guard and clitic fix) and the audit
+
+Validation AUC 0.81, calibration (hand labels) AUC 0.77; at threshold 0.5,
+86% precision / 54% recall against hand labels. End to end it beat rules
+(WER 0.1849 vs 0.1862) but looked far behind "accept every candidate"
+(0.1769) -- until `audit_verifier.py` showed why: of 200 candidates the
+verifier rejected that the *reference* called helpful, the judges said 78%
+weren't real errors -- almost all colloquial clitics respelled to match
+Soniox (`همینو` → `همین رو`, `الانم` → `الان هم`), which the WER-against-
+Soniox metric credits as fixes but aren't errors under this project's own
+goal. And of 100 "harmful" accepts, 36% were judged real fixes (`وارد` →
+`واحد`) -- the same reference-unreliable-for-names problem as step 1. This
+is why `scoring.py`'s `*_clitic` metrics exist (a change is only a "fix" if
+it's not just a clitic respelling) and why `verifier_report.py`'s judged
+precision exists (score against the judges, not just the reference).
 
 ## Next steps
 
-3. Run step 3 on a GPU and compare against `whisper`, `rules`, and the
-   rewrite runs. If edits near window edges suffer, try the read-only
-   context already stored with each window.
-4. Add a separate span detector only if false edits remain a problem.
+4. Train the v2 verifier (number guard + clitic-aware scoring) and read its
+   `verifier_report.py` output: judged precision by threshold decides the
+   production operating point. If precision is still low even where the
+   reference-based numbers look good, that's the audit's clitic-inflation
+   effect, not a real verifier problem.
+5. Add a separate span detector only if false edits remain a problem.

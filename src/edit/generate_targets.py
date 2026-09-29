@@ -54,7 +54,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from calibrate import merge_labels
-from edits import Edit, apply_edits
+from edits import Edit, apply_edits, changes_number
 from llm_judge import JudgeCache, cache_path, load_cache, make_client, run_tasks, to_label
 
 load_dotenv()
@@ -324,9 +324,16 @@ def assemble(args, out: Path, windows: list[dict], items: list[dict], judge_stat
                 counts["by hand label"] += why == "hand label"
                 undecided += status == "undecided"
                 if status == "accepted":
-                    edits.append(Edit(it["start"] - w["start"], it["end"] - w["start"],
-                                      it["whisper_span"].split(), it["soniox_span"].split(),
-                                      meta={"diff_id": diff_id, "stratum": it["stratum"], "decided_by": why}))
+                    # A hard safety rule, applied here regardless of build_diffs.py's
+                    # stratum (which predates this rule for windows already selected):
+                    # never train on an edit that changes a number -- see edits.py's
+                    # touches_number and README's "Never changes numbers".
+                    if changes_number(it["whisper_span"].split(), it["soniox_span"].split()):
+                        counts["accepted but excluded (touches a number)"] += 1
+                    else:
+                        edits.append(Edit(it["start"] - w["start"], it["end"] - w["start"],
+                                          it["whisper_span"].split(), it["soniox_span"].split(),
+                                          meta={"diff_id": diff_id, "stratum": it["stratum"], "decided_by": why}))
             if undecided:
                 # Might hold a real error the target would leave in: training on
                 # it would teach the model to skip real corrections.
