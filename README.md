@@ -94,6 +94,13 @@ src/persian_normalize.py      Persian dialectal-variation normalization for
 src/config.py                 YAML config -> Config dataclass, with typo checking
 src/evaluate.py                runs the model on a test set, scores WER,
                                saves input/output/reference/WER per row
+src/eval_checkpoint.py         re-runs the main test set against ONE
+                               checkpoint of a finished run (default: its
+                               best) -- train.py only ever scores the main
+                               set at baseline and on the final model, so an
+                               early-stopped run's test_eval/ describes a
+                               model you wouldn't ship. See "Evaluating the
+                               best checkpoint" below
 src/hub_sync.py                uploads a run's output_dir into its folder in
                                the shared Hub repo (checkpoints, tb logs,
                                config, test_eval)
@@ -1100,6 +1107,38 @@ fix_rate/preservation_rate curves) to see whether it actually reduces this
 specific failure, not just WER in aggregate -- a WER improvement alone
 wouldn't distinguish "fixed the early-stopping problem" from "got better at
 something else entirely."
+
+### Evaluating the best checkpoint
+
+`train.py` scores the **main** test set exactly twice: once at baseline and
+once on the final model. The best checkpoint is only ever identified *during*
+training, by `TestEvalCallback`/`update_best_checkpoint` (below), which on a
+run with `test.checkpoint_eval_main: false` tracks the entity/typo slices
+rather than the main set. So on any run that early-stops, or whose quality
+peaks and then declines, `test_eval/metrics.json` describes the final model
+-- which is not the model you would ship.
+
+That gap is not hypothetical. `qwen3.5-2b-100pct-masked-weighted-v2` stopped
+at step 4,000, three checkpoints past its best at 2,500, and its final-model
+WER of 0.2646 understated the best checkpoint's **0.2257** by four points --
+the difference between "about the same as untrained" and "15% better than
+untrained".
+
+```bash
+python src/eval_checkpoint.py --run_dir outputs/qwen-mask-weighted/<run-name>
+```
+
+It reads that run's own saved `resolved_config.yaml` and reproduces
+`train.py`'s final-eval call from it -- same system prompt, same generation
+settings, and the same `corpus_freq` rebuilt over the same train split, so
+`fix_rate_recoverable`'s denominator matches instead of silently differing.
+Results go to `<run_dir>/test_eval_best/`, never to `test_eval/`, which
+`train.py` owns. `--checkpoint checkpoint-2500` scores a specific numbered
+checkpoint instead of `best_checkpoint_wer`.
+
+This is a different job from `evaluate.py`'s own `--model_dir` CLI, which
+loads a whole model with `AutoModelForCausalLM` and has no adapter path, so
+it cannot score a LoRA checkpoint at all.
 
 ### Best checkpoint by WER
 
