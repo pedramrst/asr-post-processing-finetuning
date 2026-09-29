@@ -21,6 +21,7 @@ at the repo root.
 | `rules.py` | model-free fixes for glued words and stutter-doubled letters |
 | `diff_filter_baseline.py` | step 1 (below) |
 | `build_diffs.py`, `llm_judge.py`, `make_label_sheet.py`, `calibrate.py`, `generate_targets.py` | step 2: differences, LLM judges, hand-labelling pages, judge calibration, training windows |
+| `build_verifier_data.py`, `train_verifier.py` | step 4: YES/NO verifier data from the judged differences; its training and evaluation over a rewrite run's candidate edits |
 | `edit_format.py`, `windowing.py`, `train_edit.py`, `publish_edit_dataset.py`, `decode_sweep.py` | step 3: the model's input/output format, whole-transcript inference over overlapping windows, training + evaluation, publishing the training windows |
 | `corpus.py`, `normalize.py` | shared helpers: corpus word frequencies; punctuation stripping and style-only detection |
 
@@ -266,6 +267,38 @@ precision/recall and full-pipeline test metrics per threshold, uploaded to
 
 ```bash
 python3 src/edit/decode_sweep.py --run-folder edit-qwen3.5-2b
+```
+
+## Step 4: a verifier over the rewrite model's changes
+
+The threshold sweep showed the step-3 model can't find or fix errors on its
+own: of 111 edits it proposed with NONE blocked, only 16 touched a word that
+needed fixing and none had the right replacement. But the fine-tuned rewrite
+model is a strong source of *candidates*: filtering its changes perfectly
+(`diff_filter_baseline.py --subdir-suffix ""` on
+`qwen3.5-2b-50pct-masked-weighted`) would give WER 0.159 on the main test set
+(Whisper 0.193, rules 0.186) at 0.08 broken per 100 correct words; a crude
+sound-alike filter already reaches 0.180. The judges succeeded where the
+edit model failed because they chose between given versions -- so the
+verifier does exactly that.
+
+- `build_verifier_data.py`: every judged Whisper-vs-Soniox substitution is a
+  YES/NO example by the calibrated rule (undecided left out): 4,628 train,
+  233 validation, and a 99-item calibration split of hand labels whose calls
+  are kept out of training.
+- `train_verifier.py`: LoRA SFT (same machinery as `train_edit.py`); the
+  score is P(YES)/(P(YES)+P(NO)) of the first answer token. Evaluated on the
+  validation/calibration splits (AUC, precision/recall per threshold) and on
+  the test set with a rewrite run's predictions as candidates (substitutions,
+  no style-only or filler-only changes, <= 4 words; `premature_stop` rows
+  skipped), next to rules only, accept-all and the oracle. `--eval-only`
+  re-scores a trained verifier on other candidates.
+
+```bash
+python3 src/edit/build_verifier_data.py --push-folder datasets/verifier-v1   # a new folder of the shared repo
+python3 src/edit/train_verifier.py --config configs/edit/qwen3.5-2b-verifier.yaml
+python3 src/edit/train_verifier.py --config configs/edit/qwen3.5-2b-verifier.yaml --eval-only \
+    --set eval.candidates_file=qwen3.5-2b-100pct-masked-weighted-v2/test_eval_best/predictions.jsonl
 ```
 
 ## Next steps

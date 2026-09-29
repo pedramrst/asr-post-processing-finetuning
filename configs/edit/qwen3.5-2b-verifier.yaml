@@ -1,0 +1,34 @@
+# Edit verifier (src/edit/train_verifier.py): YES/NO on one proposed change.
+# Keys not set here take train_verifier.py's DEFAULTS; unknown keys are an error.
+model_id: Qwen/Qwen3.5-2B
+output_dir: ./outputs/verifier-qwen3.5-2b
+max_length: 512            # examples are ~234 tokens (max ~283 measured)
+
+data:
+  # build_verifier_data.py's train/validation/calibration splits, uploaded with
+  # --push-folder datasets/verifier-v1 into the shared repo, so a GPU instance
+  # doesn't need the local outputs/.
+  hub_repo: PedramR/ASR_Post-processing
+  hub_folder: datasets/verifier-v1
+
+training:
+  num_train_epochs: 2.0    # ~4,630 examples / effective batch 16 = ~290 steps per epoch
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 2
+  learning_rate: 1.0e-4
+  eval_steps: 50
+  save_steps: 50
+
+hub:
+  push_to_hub: true
+  repo_id: PedramR/ASR_Post-processing
+  folder: verifier-qwen3.5-2b
+
+eval:
+  # Candidate edits: a rewrite run's test predictions -- the best (step-2500)
+  # checkpoint of qwen3.5-2b-100pct-masked-weighted-v2 (rows with premature_stop
+  # are skipped automatically). Other runs: --set eval.candidates_file=<run>/.../predictions.jsonl
+  candidates_file: qwen3.5-2b-100pct-masked-weighted-v2/test_eval_best/predictions.jsonl
+  threshold: 0.5
+  thresholds: [0.3, 0.5, 0.7, 0.8, 0.9, 0.95]

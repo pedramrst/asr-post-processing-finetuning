@@ -115,7 +115,9 @@ def _merge(base: dict, override: dict, path: str = "") -> dict:
     return out
 
 
-def load_edit_config(path: str, overrides: list[str]) -> SimpleNamespace:
+def load_edit_config(path: str, overrides: list[str], defaults: dict | None = None) -> SimpleNamespace:
+    """YAML config merged over `defaults` (this module's DEFAULTS unless
+    given -- train_verifier.py passes its own), with --set overrides."""
     raw = yaml.safe_load(Path(path).read_text()) or {}
     for item in overrides:  # --set section.key=value (value parsed as YAML)
         key, _, value = item.partition("=")
@@ -124,7 +126,7 @@ def load_edit_config(path: str, overrides: list[str]) -> SimpleNamespace:
         for p in parents:
             node = node.setdefault(p, {})
         node[leaf] = yaml.safe_load(value)
-    cfg = _merge(DEFAULTS, raw)
+    cfg = _merge(DEFAULTS if defaults is None else defaults, raw)
     ns = SimpleNamespace(raw=cfg, **{k: v for k, v in cfg.items() if not isinstance(v, dict)})
     for section, values in cfg.items():
         if isinstance(values, dict):
@@ -325,18 +327,9 @@ def evaluate_validation_edits(model, tokenizer, cfg, windows: Dataset, out_dir: 
 
 # --------------------------------------------------------------------------- main
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--config", required=True)
-    p.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
-                   help="Override a config value, e.g. --set training.max_steps=5 (repeatable).")
-    args = p.parse_args()
-    cfg = load_edit_config(args.config, args.overrides)
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg.raw, sort_keys=False, allow_unicode=True))
-    os.environ["TENSORBOARD_LOGGING_DIR"] = cfg.tensorboard.logging_dir or str(out_dir / "tb")
-
+def load_lora_model(cfg):
+    """Tokenizer + base model with a fresh LoRA on all linear layers (same
+    setup as src/train.py's plain path)."""
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_id)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -347,24 +340,30 @@ def main():
     model = get_peft_model(model, LoraConfig(r=cfg.lora.r, lora_alpha=cfg.lora.alpha, lora_dropout=cfg.lora.dropout,
                                              bias="none", task_type="CAUSAL_LM", target_modules="all-linear"))
     model.print_trainable_parameters()
+    return model, tokenizer
 
-    windows = load_windows(cfg)
-    sys_prompt = system_prompt(cfg.data.target_includes_original)
 
+def tokenize_examples(tokenizer, ds: DatasetDict, to_texts, sys_prompt: str, max_length: int) -> DatasetDict:
+    """`to_texts(row) -> (user, target)` for every row, tokenized with the
+    prompt masked out of the loss (data.build_example); over-long rows dropped."""
     def _map(row):
-        user, target = example_texts(row, cfg.data.target_includes_original)
-        return build_example(tokenizer, user, target, max_length=cfg.max_length, system_prompt=sys_prompt)
+        user, target = to_texts(row)
+        return build_example(tokenizer, user, target, max_length=max_length, system_prompt=sys_prompt)
 
-    tokenized = windows.map(_map, remove_columns=windows["train"].column_names)
+    tokenized = ds.map(_map, remove_columns=ds["train"].column_names)
     status = Counter(s for split in tokenized.values() for s in split["status"])
-    print(f"Tokenization: {dict(status)} (max_length={cfg.max_length})")
-    tokenized = tokenized.filter(lambda ex: ex["status"] != "dropped").remove_columns(
+    print(f"Tokenization: {dict(status)} (max_length={max_length})")
+    return tokenized.filter(lambda ex: ex["status"] != "dropped").remove_columns(
         ["status", "masked_low_signal_tokens", "weighted_recoverable_tokens", "short_target_downweighted_tokens",
          "token_weights"])
 
+
+def make_trainer(cfg, model, tokenizer, tokenized: DatasetDict) -> Trainer:
+    """HF Trainer from cfg.training: eval_loss on the validation split (best
+    checkpoint kept), TensorBoard, Hub sync on every save if enabled."""
     has_eval = "validation" in tokenized
     t = cfg.training
-    trainer = Trainer(
+    return Trainer(
         model=model,
         args=TrainingArguments(
             output_dir=cfg.output_dir,
@@ -395,6 +394,34 @@ def main():
         data_collator=PadCollator(pad_token_id=tokenizer.pad_token_id),
         callbacks=[SyncToHubCallback(cfg)] if cfg.hub.push_to_hub else [],
     )
+
+
+def prepare_output_dir(cfg) -> Path:
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "config.yaml").write_text(yaml.safe_dump(cfg.raw, sort_keys=False, allow_unicode=True))
+    os.environ["TENSORBOARD_LOGGING_DIR"] = cfg.tensorboard.logging_dir or str(out_dir / "tb")
+    return out_dir
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--config", required=True)
+    p.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
+                   help="Override a config value, e.g. --set training.max_steps=5 (repeatable).")
+    args = p.parse_args()
+    cfg = load_edit_config(args.config, args.overrides)
+    if cfg.hub.push_to_hub:  # a new run never lands in an existing Hub folder
+        from hub_utils import ensure_new_folder
+
+        ensure_new_folder(cfg.hub_repo_id, cfg.hub_repo_folder or Path(cfg.output_dir).name)
+    out_dir = prepare_output_dir(cfg)
+    model, tokenizer = load_lora_model(cfg)
+
+    windows = load_windows(cfg)
+    tokenized = tokenize_examples(tokenizer, windows, lambda row: example_texts(row, cfg.data.target_includes_original),
+                                  system_prompt(cfg.data.target_includes_original), cfg.max_length)
+    trainer = make_trainer(cfg, model, tokenizer, tokenized)
 
     if cfg.eval.baseline:
         print("Baseline evaluation (untrained model)...")

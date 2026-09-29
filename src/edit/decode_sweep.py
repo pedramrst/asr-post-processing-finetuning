@@ -20,7 +20,7 @@ Reported for a sweep of thresholds:
 
 Writes sweep.md / sweep.json and per-window records (p_none, greedy and
 blocked outputs) to --output-dir, and uploads them into the run's Hub
-folder under decode_sweep/ (unless --no-push).
+folder under a new decode_sweep-<time>/ subfolder (unless --no-push).
 
 Example (on the GPU instance):
   python3 src/edit/decode_sweep.py --run-folder edit-qwen3.5-2b
@@ -30,13 +30,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/, for the shared modules
 
 import torch  # noqa: E402
 from dotenv import load_dotenv  # noqa: E402
-from huggingface_hub import HfApi  # noqa: E402
 from peft import PeftModel  # noqa: E402
 from tqdm import tqdm  # noqa: E402
 from transformers import AutoModelForCausalLM, AutoTokenizer, LogitsProcessor, LogitsProcessorList  # noqa: E402
@@ -85,21 +85,26 @@ def _batches(prompts, batch_size):
 
 
 @torch.no_grad()
-def first_token_prob(model, tokenizer, prompts: list[str], token_id: int, batch_size: int) -> list[float]:
-    """P(first generated token == token_id) per prompt, from one forward pass
-    that keeps only the last position's logits."""
-    probs = [0.0] * len(prompts)
+def first_token_probs(model, tokenizer, prompts: list[str], token_ids: list[int], batch_size: int) -> list[list[float]]:
+    """P(first generated token == t) for each t in token_ids, per prompt, from
+    one forward pass that keeps only the last position's logits (the full
+    logits of Qwen3.5's ~248k-token vocabulary would be several GB a batch)."""
+    probs = [[0.0] * len(token_ids) for _ in prompts]
     tokenizer.padding_side = "left"
-    for idx in tqdm(list(_batches(prompts, batch_size)), desc="p_none"):
+    for idx in tqdm(list(_batches(prompts, batch_size)), desc="first-token probs"):
         enc = tokenizer([prompts[i] for i in idx], return_tensors="pt", padding=True, add_special_tokens=False).to(model.device)
         try:
             logits = model(**enc, logits_to_keep=1).logits[:, -1, :]
         except TypeError:  # older model classes without logits_to_keep
             logits = model(**enc).logits[:, -1, :]
-        p = torch.softmax(logits.float(), dim=-1)[:, token_id].tolist()
+        p = torch.softmax(logits.float(), dim=-1)[:, token_ids].tolist()
         for i, v in zip(idx, p):
             probs[i] = v
     return probs
+
+
+def first_token_prob(model, tokenizer, prompts: list[str], token_id: int, batch_size: int) -> list[float]:
+    return [p[0] for p in first_token_probs(model, tokenizer, prompts, [token_id], batch_size)]
 
 
 @torch.no_grad()
@@ -227,9 +232,11 @@ def main():
     print("\n".join(lines))
 
     if not args.no_push and not args.adapter_dir:
-        HfApi().upload_folder(repo_id=args.hub_repo, folder_path=str(out),
-                              path_in_repo=f"{args.run_folder}/decode_sweep", commit_message="decode sweep")
-        print(f"Uploaded to https://huggingface.co/{args.hub_repo}/tree/main/{args.run_folder}/decode_sweep")
+        from hub_utils import upload_new_folder
+
+        # a new timestamped subfolder: an earlier sweep's files are never overwritten
+        print("Uploaded to", upload_new_folder(args.hub_repo, out, f"{args.run_folder}/decode_sweep-{time.strftime('%Y%m%d-%H%M')}",
+                                               "decode sweep"))
 
 
 if __name__ == "__main__":
