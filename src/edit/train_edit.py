@@ -175,13 +175,10 @@ def chat_prompts(tokenizer, users: list[str], sys_prompt: str) -> list[str]:
                                           tokenize=False, add_generation_prompt=True) for u in users]
 
 
-def evaluate_on_test(model, tokenizer, cfg, out_dir: Path, tag: str = "") -> dict:
-    """Full-transcript evaluation (see module docstring). Writes
-    test_eval{tag}/metrics.json (model on the main test set, with "wer" at the
-    top level for run_sweep.py), baselines.json (whisper / rules on the same
-    rows), predictions.jsonl, comparison.md, and the entity/typo slices'
-    metrics.json/baselines.json under test_eval_entity{tag}/ and
-    test_eval_typo{tag}/."""
+def load_test_set(cfg) -> SimpleNamespace:
+    """The test transcripts with everything the evaluation needs: CRM names,
+    Whisper text before and after rules.py, references, eval-only entity
+    labels, and which rows belong to which slice (main / entity / typo)."""
     e = cfg.eval
     test = _load_hub_columns_pruned(e.test_dataset_id, ["call_id", "text_whisper", "text", "crm_metadata"], "test")
     rows = [r for r in test if r["text_whisper"] and r["text"]]
@@ -194,17 +191,84 @@ def evaluate_on_test(model, tokenizer, cfg, out_dir: Path, tag: str = "") -> dic
         for r in ev:
             if r["text_whisper"] in by_text:
                 slices.setdefault(r["row_type"], set()).add(by_text[r["text_whisper"]])
-
     freq = load_corpus_freq(e.corpus_freq_repo)
     gemini = load_gemini_entities(e.entities_dir) if e.entities_dir and Path(e.entities_dir).exists() else {}
     names = [sorted(crm_candidates(r["crm_metadata"])) for r in rows]
     whisper = [r["text_whisper"] for r in rows]
-    after_rules = [apply_edits(w, rule_edits(w, freq, protected=set(n))) for w, n in zip(whisper, names)]
     refs = [r["text"] for r in rows]
-    spans = [reference_entity_spans(ref, set(n), gemini.get(r["call_id"], [])) for ref, n, r in zip(refs, names, rows)]
+    return SimpleNamespace(
+        rows=rows, slices={k: sorted(v) for k, v in slices.items()}, freq=freq, names=names, whisper=whisper,
+        after_rules=[apply_edits(w, rule_edits(w, freq, protected=set(n))) for w, n in zip(whisper, names)],
+        refs=refs,
+        spans=[reference_entity_spans(ref, set(n), gemini.get(r["call_id"], [])) for ref, n, r in zip(refs, names, rows)],
+    )
 
-    index, users = build_window_prompts(after_rules, names, e.window_words, e.stride)
-    print(f"Evaluating on {len(rows)} transcripts ({len(users)} windows)...")
+
+def window_records(index, outputs, n_transcripts: int, **extra_per_window) -> list[list[dict]]:
+    """Per transcript, every window's span and the model's raw output (plus
+    any extra per-window lists, e.g. p_none) -- for error analysis."""
+    per_t = [[] for _ in range(n_transcripts)]
+    for k, ((t, w), out) in enumerate(zip(index, outputs)):
+        rec = {"start": w.start, "end": w.end, "core_start": w.core_start, "core_end": w.core_end, "output": out}
+        rec.update({name: values[k] for name, values in extra_per_window.items()})
+        per_t[t].append(rec)
+    return per_t
+
+
+def write_test_outputs(ts, results, windows_per_t, out_dir: Path, tag: str = "") -> dict:
+    """Scores merged transcripts on every slice and writes, per slice dir
+    (test_eval{tag}/ for main, test_eval_<slice>{tag}/ otherwise):
+    metrics.json (the model; flat, "wer" at the top for run_sweep.py),
+    baselines.json (whisper / rules on the same rows) and predictions.jsonl
+    (per transcript: input, after_rules, output, reference, kept edits,
+    rejected lines, and every window's raw model output), plus
+    test_eval{tag}/comparison.md. Returns the main slice's model metrics."""
+    corrected = [r.corrected for r in results]
+    table = []
+    main_metrics = None
+    for name, idx in ts.slices.items():
+        pick = lambda xs: [xs[i] for i in idx]  # noqa: E731
+        per_method = {method: score(pick(ts.whisper), pick(hyps), pick(ts.refs), ts.freq, pick(ts.spans))
+                      for method, hyps in (("whisper", ts.whisper), ("rules", ts.after_rules), ("model", corrected))}
+        m = dict(per_method["model"])
+        m["rejected_lines_per_transcript"] = sum(len(results[i].rejected_lines) for i in idx) / max(len(idx), 1)
+        m["edits_per_transcript"] = sum(len(results[i].edits) for i in idx) / max(len(idx), 1)
+        slice_dir = out_dir / (f"test_eval{tag}" if name == "main" else f"test_eval_{name}{tag}")
+        slice_dir.mkdir(parents=True, exist_ok=True)
+        (slice_dir / "metrics.json").write_text(json.dumps(m, indent=2))
+        (slice_dir / "baselines.json").write_text(json.dumps(
+            {k: v for k, v in per_method.items() if k != "model"}, indent=2))
+        with open(slice_dir / "predictions.jsonl", "w", encoding="utf-8") as f:
+            for i in idx:
+                res = results[i]
+                f.write(json.dumps({
+                    "call_id": ts.rows[i]["call_id"], "input": ts.whisper[i], "after_rules": ts.after_rules[i],
+                    "output": res.corrected, "reference": ts.refs[i], "crm_names": ts.names[i],
+                    "edits": [{"start": x.start, "end": x.end, "original": " ".join(x.original),
+                               "replacement": " ".join(x.replacement)} for x in res.edits],
+                    "rejected_lines": res.rejected_lines, "window_outputs": windows_per_t[i],
+                }, ensure_ascii=False) + "\n")
+        if name == "main":
+            main_metrics = m
+        for method, v in per_method.items():
+            table.append(f"| {name} | {method} | {v['wer']:.4f} | {v['fixed_lenient']} | {v['broken_lenient']} | "
+                         f"{v['net_fixed_lenient']} | {v['broken_per_100_correct']:.2f} | "
+                         f"{(v.get('entity_fix_rate') or 0):.3f} | {v['rows_changed']:.3f} |")
+    header = ["| slice | method | WER | fixed | broken | net | broken/100 | entity fix | rows changed |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    (out_dir / f"test_eval{tag}" / "comparison.md").write_text("\n".join(header + table) + "\n", encoding="utf-8")
+    print("\n".join(header + table))
+    return main_metrics
+
+
+def evaluate_on_test(model, tokenizer, cfg, out_dir: Path, tag: str = "") -> dict:
+    """Full-transcript evaluation (see module docstring): rules, overlapping
+    windows through the model (greedy), edits merged, scored and written by
+    write_test_outputs()."""
+    e = cfg.eval
+    ts = load_test_set(cfg)
+    index, users = build_window_prompts(ts.after_rules, ts.names, e.window_words, e.stride)
+    print(f"Evaluating on {len(ts.rows)} transcripts ({len(users)} windows)...")
     was_training = model.training
     model.eval()
     outputs = generate_batch(model, tokenizer, chat_prompts(tokenizer, users, system_prompt(cfg.data.target_includes_original)),
@@ -212,53 +276,15 @@ def evaluate_on_test(model, tokenizer, cfg, out_dir: Path, tag: str = "") -> dic
     model.train(was_training)
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    results = merge_outputs(after_rules, index, outputs)
-    corrected = [r.corrected for r in results]
-
-    run_dir = out_dir / f"test_eval{tag}"
-    run_dir.mkdir(parents=True, exist_ok=True)
-    with open(run_dir / "predictions.jsonl", "w", encoding="utf-8") as f:
-        for r, w, ar, res, ref in zip(rows, whisper, after_rules, results, refs):
-            f.write(json.dumps({"input": w, "after_rules": ar, "output": res.corrected, "reference": ref,
-                                "edits": [{"start": x.start, "end": x.end, "original": " ".join(x.original),
-                                           "replacement": " ".join(x.replacement)} for x in res.edits],
-                                "rejected_lines": res.rejected_lines, "windows": res.windows}, ensure_ascii=False) + "\n")
-
-    table, all_metrics = [], {}
-    for name, idx in slices.items():
-        idx = sorted(idx)
-        pick = lambda xs: [xs[i] for i in idx]  # noqa: E731
-        per_method = {method: score(pick(whisper), pick(hyps), pick(refs), freq, pick(spans))
-                      for method, hyps in (("whisper", whisper), ("rules", after_rules), ("model", corrected))}
-        all_metrics[name] = per_method
-        m = dict(per_method["model"])
-        m["rejected_lines_per_transcript"] = sum(len(results[i].rejected_lines) for i in idx) / max(len(idx), 1)
-        m["edits_per_transcript"] = sum(len(results[i].edits) for i in idx) / max(len(idx), 1)
-        slice_dir = run_dir if name == "main" else out_dir / f"test_eval_{name}{tag}"
-        slice_dir.mkdir(parents=True, exist_ok=True)
-        (slice_dir / "metrics.json").write_text(json.dumps(m, indent=2))  # flat: run_sweep.py prints it
-        (slice_dir / "baselines.json").write_text(json.dumps(
-            {k: v for k, v in per_method.items() if k != "model"}, indent=2))
-        for method, v in per_method.items():
-            table.append(f"| {name} | {method} | {v['wer']:.4f} | {v['fixed_lenient']} | {v['broken_lenient']} | "
-                         f"{v['net_fixed_lenient']} | {v['broken_per_100_correct']:.2f} | "
-                         f"{(v.get('entity_fix_rate') or 0):.3f} | {v['rows_changed']:.3f} |")
-    header = ["| slice | method | WER | fixed | broken | net | broken/100 | entity fix | rows changed |",
-              "|---|---|---|---|---|---|---|---|---|"]
-    (run_dir / "comparison.md").write_text("\n".join(header + table) + "\n", encoding="utf-8")
-    print("\n".join(header + table))
-    return all_metrics["main"]["model"]
+    results = merge_outputs(ts.after_rules, index, outputs)
+    return write_test_outputs(ts, results, window_records(index, outputs, len(ts.rows)), out_dir, tag)
 
 
-def evaluate_validation_edits(model, tokenizer, cfg, windows: Dataset, out_dir: Path) -> dict:
-    """Edit-level accuracy on the held-out validation windows: exact-match
-    precision/recall of the model's edits against the verified targets, and
-    how often its output lines were rejected as malformed."""
-    users = [render_input(r["source"].split(), r.get("crm_names") or []) for r in windows]
-    model.eval()
-    outputs = generate_batch(model, tokenizer, chat_prompts(tokenizer, users, system_prompt(cfg.data.target_includes_original)),
-                             cfg.eval.max_new_tokens, cfg.eval.batch_size)
+def validation_scores(windows, outputs) -> tuple[dict, list[dict]]:
+    """Exact-match edit precision/recall of `outputs` on validation windows,
+    and one record per window for validation_predictions.jsonl."""
     tp = n_pred = n_gold = rejected = exact = 0
+    records = []
     for r, out in zip(windows, outputs):
         parsed = parse_edits(out, r["source"].split())
         pred = {(e.start, e.end, " ".join(e.replacement)) for e in parsed.edits}
@@ -268,10 +294,31 @@ def evaluate_validation_edits(model, tokenizer, cfg, windows: Dataset, out_dir: 
         n_gold += len(gold)
         rejected += len(parsed.rejected)
         exact += pred == gold
-    m = {"windows": len(windows), "edit_precision": tp / n_pred if n_pred else None,
-         "edit_recall": tp / n_gold if n_gold else None, "window_exact_match": exact / len(windows),
+        records.append({"window_id": r["window_id"], "source": r["source"], "crm_names": r.get("crm_names") or [],
+                        "gold_edits": [{k: e[k] for k in ("start", "end", "original", "replacement", "stratum")}
+                                       for e in r["edits"]],
+                        "output": out, "predicted_edits": [{"start": e.start, "end": e.end, "original": " ".join(e.original),
+                                                            "replacement": " ".join(e.replacement)} for e in parsed.edits],
+                        "rejected_lines": parsed.rejected, "correct": sorted(pred & gold) == sorted(pred) == sorted(gold)})
+    m = {"windows": len(outputs), "edit_precision": tp / n_pred if n_pred else None,
+         "edit_recall": tp / n_gold if n_gold else None, "window_exact_match": exact / max(len(outputs), 1),
          "rejected_lines": rejected, "predicted_edits": n_pred, "gold_edits": n_gold}
+    return m, records
+
+
+def evaluate_validation_edits(model, tokenizer, cfg, windows: Dataset, out_dir: Path) -> dict:
+    """Edit-level accuracy on the held-out validation windows (see
+    validation_scores); writes validation_edits.json and, per window,
+    validation_predictions.jsonl."""
+    users = [render_input(r["source"].split(), r.get("crm_names") or []) for r in windows]
+    model.eval()
+    outputs = generate_batch(model, tokenizer, chat_prompts(tokenizer, users, system_prompt(cfg.data.target_includes_original)),
+                             cfg.eval.max_new_tokens, cfg.eval.batch_size)
+    m, records = validation_scores(windows, outputs)
     (out_dir / "validation_edits.json").write_text(json.dumps(m, indent=2))
+    with open(out_dir / "validation_predictions.jsonl", "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     print("Validation edits:", m)
     return m
 

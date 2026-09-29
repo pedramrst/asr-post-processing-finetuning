@@ -21,7 +21,7 @@ at the repo root.
 | `rules.py` | model-free fixes for glued words and stutter-doubled letters |
 | `diff_filter_baseline.py` | step 1 (below) |
 | `build_diffs.py`, `llm_judge.py`, `make_label_sheet.py`, `calibrate.py`, `generate_targets.py` | step 2: differences, LLM judges, hand-labelling pages, judge calibration, training windows |
-| `edit_format.py`, `windowing.py`, `train_edit.py`, `publish_edit_dataset.py` | step 3: the model's input/output format, whole-transcript inference over overlapping windows, training + evaluation, publishing the training windows |
+| `edit_format.py`, `windowing.py`, `train_edit.py`, `publish_edit_dataset.py`, `decode_sweep.py` | step 3: the model's input/output format, whole-transcript inference over overlapping windows, training + evaluation, publishing the training windows |
 | `corpus.py`, `normalize.py` | shared helpers: corpus word frequencies; punctuation stripping and style-only detection |
 
 Scripts are run from the repo root, e.g. `python3 src/edit/diff_filter_baseline.py`.
@@ -245,6 +245,28 @@ schema is its own (`DEFAULTS` in `train_edit.py`, unknown keys rejected): the
 rewrite pipeline's masking/weighting options assume a full-transcript
 target. Entity metrics use Gemini labels only where `data/output-backup/`
 exists (locally); elsewhere they fall back to CRM names.
+
+### First run and threshold decoding
+
+The first run (`edit-qwen3.5-2b` in the model repo): validation loss was
+best at step 150 (end of epoch 1: 0.936), flat after, while training loss
+halved -- the kept checkpoint is step 150. The model output NONE for almost
+every window (41 edits in 12,934 test windows; 9 helped, 12 hurt), so the
+result is essentially rules-only: WER 0.1863 vs Whisper 0.1929, 99.95% of
+correct words kept (the rewrite run: WER 0.363, 76% kept). Likely causes:
+greedy decoding puts all "no edit" probability on one token while edits are
+spread over many word numbers; ~45% of training edits are `other_sub`
+(sides don't sound alike, not inferable from text); few edits overall.
+
+`decode_sweep.py` tests the first cause without retraining: per window it
+measures p(NONE as first token), generates with NONE blocked, and uses the
+blocked output where p_none < threshold; reports validation edit
+precision/recall and full-pipeline test metrics per threshold, uploaded to
+`<run-folder>/decode_sweep/`.
+
+```bash
+python3 src/edit/decode_sweep.py --run-folder edit-qwen3.5-2b
+```
 
 ## Next steps
 
