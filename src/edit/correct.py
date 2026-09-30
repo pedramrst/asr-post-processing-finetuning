@@ -88,6 +88,8 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=1024)
     p.add_argument("--max-span-words", type=int, default=4)
     p.add_argument("--context-words", type=int, default=12)
+    p.add_argument("--no-extended-rules", dest="extended_rules", action="store_false",
+                   help="Use rules.py's original glue splitter (no half-space words, no final \u0648).")
     p.add_argument("--keep-intermediates", action="store_true",
                    help="Also write after_rules, the raw rewrite, and every candidate with its score.")
     return p.parse_args()
@@ -162,7 +164,7 @@ def main():
     # 1. rules.py -- deterministic, no model (allow_numbers: it only ever
     #    re-segments the same characters; see build_diffs.py's comment).
     freq = load_corpus_freq(args.corpus_freq_repo)
-    after_rules = [apply_edits(w, rule_edits(w, freq, protected=set(n)), allow_numbers=True)
+    after_rules = [apply_edits(w, rule_edits(w, freq, protected=set(n), extended=args.extended_rules), allow_numbers=True)
                    for w, n in zip(whisper, names)]
 
     model, tokenizer = load_models(args)

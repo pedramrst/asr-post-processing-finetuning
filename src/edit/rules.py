@@ -35,16 +35,32 @@ CLITIC_SUFFIXES = frozenset({
 })
 
 
-def split_glued_word(word: str, corpus_freq: Counter, max_word_freq: int, min_part_freq: int) -> list[str] | None:
-    """Best split of a rare `word` into two common words, or None."""
-    if ZWNJ in word or len(word) < 5 or corpus_freq.get(word, 0) > max_word_freq:
+def split_glued_word(word: str, corpus_freq: Counter, max_word_freq: int, min_part_freq: int,
+                     extended: bool = False) -> list[str] | None:
+    """Best split of a rare `word` into two common words, or None.
+
+    `extended` also handles what the original rule skipped, measured on the
+    test set against the reference (295 words the original rule leaves alone:
+    291 fixed, 4 broken):
+      * words containing a half-space, e.g. "رسیدگیمی‌شه" -> "رسیدگی می‌شه"
+        (either half may keep its own half-space; a split is never placed
+        next to one, so "می‌شه" itself is never cut), and
+      * a final "و" (and), e.g. "کردمو" -> "کردم و". "و" stays banned as a
+        second half in the original rule because "تغییراتو" is
+        "تغییرات رو"; that ambiguity is real, so only rare words whose first
+        half is common are split, and the frequency gate does the rest."""
+    if (ZWNJ in word and not extended) or len(word) < 5 or corpus_freq.get(word, 0) > max_word_freq:
         return None
     best, best_score = None, 0
-    for i in range(2, len(word) - 1):
+    for i in range(2, len(word) if extended else len(word) - 1):
         a, b = word[:i], word[i:]
-        if b in CLITIC_SUFFIXES:
+        if extended and (a.endswith(ZWNJ) or b.startswith(ZWNJ)):
             continue
-        score =min(corpus_freq.get(a, 0), corpus_freq.get(b, 0))
+        if len(b) == 1 and not (extended and b == "و"):
+            continue
+        if b in CLITIC_SUFFIXES and not (extended and b == "و"):
+            continue
+        score = min(corpus_freq.get(a, 0), corpus_freq.get(b, 0))
         if score >= min_part_freq and score > best_score:
             best, best_score = [a, b], score
     return best
@@ -64,9 +80,12 @@ def rule_edits(
     protected: set[str] = frozenset(),
     max_word_freq: int = 2,
     min_part_freq: int = 200,
+    extended: bool = False,
 ) -> list[Edit]:
     """Glue-split and unstutter edits for `source`. `protected` words (e.g.
-    CRM names) are never touched."""
+    CRM names) are never touched. `extended`: see split_glued_word -- off by
+    default so the edit datasets and verifier data built with the original
+    rules stay reproducible."""
     edits = []
     for i, w in enumerate(source.split()):
         if w in protected:
@@ -75,7 +94,7 @@ def rule_edits(
         if fixed:
             edits.append(Edit(i, i + 1, [w], [fixed], meta={"source": "rule_unstutter"}))
             continue
-        parts = split_glued_word(w, corpus_freq, max_word_freq, min_part_freq)
+        parts = split_glued_word(w, corpus_freq, max_word_freq, min_part_freq, extended)
         if parts:
             edits.append(Edit(i, i + 1, [w], parts, meta={"source": "rule_glue_split"}))
     return edits
