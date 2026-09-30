@@ -37,7 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # src/, for the sh
 
 import jiwer  # noqa: E402
 
+from build_diffs import is_filler_edit  # noqa: E402
 from data import low_signal_word_ranges  # noqa: E402
+from edits import Edit, changes_number  # noqa: E402
 from evaluate import (  # noqa: E402
     _equal_or_equivalent_positions,
     _equal_positions,
@@ -45,9 +47,10 @@ from evaluate import (  # noqa: E402
     _word_overlap_pct,
 )
 from persian_normalize import normalize_lenient  # noqa: E402
-from normalize import normalize_clitics  # noqa: E402
+from normalize import is_style_edit, normalize_clitics  # noqa: E402
 
 HALLUCINATION_OVERLAP_FLOOR = 50.0  # evaluate.py's default
+IN_SCOPE_MAX_SPAN_WORDS = 4  # train_verifier.py's eval.max_span_words default
 FIX_WEIGHT = 0.5  # evaluate.py's default
 
 
@@ -58,6 +61,40 @@ def _contains_span(text: str, span: str) -> bool:
     span_words = normalize_lenient(span).split()
     k = len(span_words)
     return k > 0 and any(words[i:i + k] == span_words for i in range(len(words) - k + 1))
+
+
+def in_scope_positions(source: str, reference: str, max_span_words: int = IN_SCOPE_MAX_SPAN_WORDS) -> set[int]:
+    """Reference-word positions of the errors this pipeline could ever fix,
+    on the lenient-normalized text (so it lines up with fix_rate_lenient).
+
+    The corrector only ever applies substitutions of <= max_span_words words
+    that aren't style-only, filler-only or number-changing (train_verifier's
+    extract_candidates + edits.py's changes_number). Every other error --
+    a word Whisper dropped entirely, a long garbled run, a number -- is out
+    of scope by design, so counting it in fix_rate's denominator measures
+    what we chose not to attempt rather than how well we attempt it. This is
+    the same idea as evaluate.py's fix_rate_recoverable, scoped to our
+    filters instead of to phonetic recoverability.
+
+    Report it ALONGSIDE the plain fix_rate, never instead of it: on its own
+    it flatters any method by shrinking its own denominator, so the reader
+    needs the in-scope count too (score() reports it as in_scope_targets).
+    """
+    ref_l, src_l = normalize_lenient(reference), normalize_lenient(source)
+    ref_w, src_w = ref_l.split(), src_l.split()
+    scope: set[int] = set()
+    for chunk in jiwer.process_words([ref_l], [src_l]).alignments[0]:
+        if chunk.type != "substitute":
+            continue  # "equal" isn't an error; insert/delete are out of scope for v1
+        ref_span = ref_w[chunk.ref_start_idx:chunk.ref_end_idx]
+        src_span = src_w[chunk.hyp_start_idx:chunk.hyp_end_idx]
+        if max(len(ref_span), len(src_span)) > max_span_words:
+            continue
+        e = Edit(chunk.hyp_start_idx, chunk.hyp_end_idx, src_span, ref_span)
+        if is_style_edit(e) or is_filler_edit(e) or changes_number(src_span, ref_span):
+            continue
+        scope.update(range(chunk.ref_start_idx, chunk.ref_end_idx))
+    return scope
 
 
 def lenient_positions(source: str, hypothesis: str, reference: str) -> tuple[set[int], set[int], set[int], str]:
@@ -102,6 +139,7 @@ def score(
     fix_hl = fix_tl = keep_hl = keep_tl = 0
     fix_hr = fix_tr = unrecoverable = 0
     fix_hc = keep_hc = keep_tc = 0
+    fix_hs = fix_ts = 0
     clitic = [(normalize_clitics(s_), normalize_clitics(h_), normalize_clitics(r_))
               for s_, h_, r_ in zip(sources, hypotheses, references)]
     ent_fix_h = ent_fix_t = ent_keep_h = ent_keep_t = 0
@@ -127,6 +165,12 @@ def score(
         fix_hc += len(target_c & still_c)
         keep_hc += len(already_c & still_c)
         keep_tc += len(already_c)
+
+        # Only the errors this pipeline is designed to be able to fix (see
+        # in_scope_positions) -- always reported next to the plain fix_rate.
+        scope = in_scope_positions(src, ref) & target_l
+        fix_hs += len(scope & still_l)
+        fix_ts += len(scope)
 
         if corpus_freq is not None:
             bad = set()
@@ -171,6 +215,12 @@ def score(
     m["broken_clitic"] = keep_tc - keep_hc
     m["net_fixed_clitic"] = fix_hc - (keep_tc - keep_hc)
     m["broken_per_100_correct_clitic"] = 100 * (keep_tc - keep_hc) / keep_tc if keep_tc else None
+    # fix_rate over only the errors the corrector could ever fix -- see
+    # in_scope_positions. in_scope_targets is what its denominator dropped to,
+    # against fix_rate_lenient's; quote the two together or not at all.
+    m["fix_rate_in_scope"] = ratio(fix_hs, fix_ts)
+    m["in_scope_targets"] = fix_ts
+    m["lenient_targets"] = fix_tl
     if corpus_freq is not None:
         m["fix_rate_recoverable"] = ratio(fix_hr, fix_tr)
         m["unrecoverable_targets"] = unrecoverable
